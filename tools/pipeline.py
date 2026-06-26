@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import copy
+import gc
 import inspect
+import resource
+import threading
+import time
+from contextlib import contextmanager
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -21,7 +26,6 @@ from tools.search import (
 )
 from tools.track import NullTracker, Tracker
 from tools.transform import Passthrough, Transform
-
 
 Score = Callable[..., float]
 _NO_COMBINE = object()
@@ -88,32 +92,75 @@ class Pipeline:
         self.val_filters = tuple(self.val_filters)
         self.test_filters = tuple(self.test_filters)
         self._transform_cache: dict[tuple[str, ...], Transform] = {}
-        self._array_cache: dict[tuple[Any, ...], tuple[np.ndarray, np.ndarray, dict[str, Any]]] = {}
+        self._array_cache: dict[
+            tuple[Any, ...], tuple[np.ndarray, np.ndarray, dict[str, Any]]
+        ] = {}
 
-    def train(self) -> dict[str, Any]:
+    def train(
+        self,
+        verbose: int = 0,
+        memory_log: bool = False,
+        memory_interval: float = 0.05,
+    ) -> dict[str, Any]:
         folds = expanding_folds(self.rolling_dates)
         self.validation_history.clear()
-        self.tracker.start_run({"sampler": self.sampler, "n_trials": self.n_trials, "n_folds": len(folds)})
+        self.tracker.start_run(
+            {"sampler": self.sampler, "n_trials": self.n_trials, "n_folds": len(folds)}
+        )
         try:
-            self.study = create_study(self.sampler, self.search_space, pruner=self.pruner, seed=self.seed)
+            self.study = create_study(
+                self.sampler, self.search_space, pruner=self.pruner, seed=self.seed
+            )
             import optuna
+
+            if verbose > 0:
+                print(f"======== Optuna study created. Launching optimization.")
 
             def objective(trial: Any) -> float:
                 params = suggest_params(self.search_space, trial)
                 trial.set_user_attr("params", params)
+                if verbose > 0:
+                    print(f"======== running params {params}")
                 self.tracker.log_params({f"param/{k}": v for k, v in params.items()})
                 scores: list[float] = []
                 sizes: list[int] = []
                 for fold, (train_dates, val_dates) in enumerate(folds):
-                    fitted = self._fit_transform(train_dates)
-                    train_src = self._src(train_dates, self.train_filters, fitted, "train")
+                    if verbose > 1:
+                        print(
+                            f"======== fold: {fold}, with train = {train_dates} and val = {val_dates}"
+                        )
+                    with self._memory_log(
+                        f"trial={trial.number} fold={fold} _fit_transform train_dates={train_dates}",
+                        enabled=memory_log,
+                        interval=memory_interval,
+                    ):
+                        fitted = self._fit_transform(train_dates)
+                    train_src = self._src(
+                        train_dates, self.train_filters, fitted, "train"
+                    )
                     val_src = self._src(val_dates, self.val_filters, fitted, "val")
                     model = self.adapter.build(params)
-                    model = self._fit_model(model, train_src, val_src, trial)
-                    loss, ctx, _ = self._evaluate(model, val_src, self.val_score, fold)
+                    if verbose > 2:
+                        print("======== built model, start training...")
+                    with self._memory_log(
+                        f"trial={trial.number} fold={fold} _fit_model train_dates={train_dates} val_dates={val_dates}",
+                        enabled=memory_log,
+                        interval=memory_interval,
+                    ):
+                        model = self._fit_model(model, train_src, val_src, trial)
+                    with self._memory_log(
+                        f"trial={trial.number} fold={fold} _evaluate val_dates={val_dates}",
+                        enabled=memory_log,
+                        interval=memory_interval,
+                    ):
+                        loss, ctx, _ = self._evaluate(
+                            model, val_src, self.val_score, fold
+                        )
                     scores.append(loss)
                     sizes.append(int(ctx["n"]))
                     running = weighted_mean(scores, sizes, self.fold_weighting)
+                    if verbose > 1:
+                        print(f"======== loss = {loss}, running average = {running}")
                     record = {
                         "trial": trial.number,
                         "fold": fold,
@@ -124,6 +171,8 @@ class Pipeline:
                         "natures": ctx.get("natures"),
                         "params": params,
                     }
+                    if verbose > 2:
+                        print("======== record = \n", record)
                     self.validation_history.append(record)
                     self.tracker.log(
                         {
@@ -140,8 +189,19 @@ class Pipeline:
                 return weighted_mean(scores, sizes, self.fold_weighting)
 
             self.study.optimize(objective, n_trials=self.n_trials)
-            self.best_params = dict(self.study.best_trial.user_attrs.get("params", self.study.best_params))
-            self.model = self._refit(self.best_params)
+            if verbose > 0:
+                print(
+                    "======== optimization finished, best params extracted. Refitting with best params."
+                )
+            self.best_params = dict(
+                self.study.best_trial.user_attrs.get("params", self.study.best_params)
+            )
+            self.model = self._refit(
+                self.best_params,
+                memory_log=memory_log,
+                memory_interval=memory_interval,
+            )
+            print("======== training done.")
             return {
                 "best_params": self.best_params,
                 "best_score": float(self.study.best_value),
@@ -154,27 +214,48 @@ class Pipeline:
     def test(self) -> dict[str, Any]:
         if self.model is None:
             raise RuntimeError("call train() before test()")
-        transform = self.fitted_transform or self._fit_transform(self._all_train_dates())
+        transform = self.fitted_transform or self._fit_transform(
+            self._all_train_dates()
+        )
         src = self._src(self.test_dates, self.test_filters, transform, "test")
-        loss, ctx, y_pred = self._evaluate(self.model, src, self.test_score, "test", keep_predictions=True)
+        loss, ctx, y_pred = self._evaluate(
+            self.model, src, self.test_score, "test", keep_predictions=True
+        )
         return {"test_score": loss, "n": int(ctx["n"]), "ctx": ctx, "y_pred": y_pred}
 
     def get_model(self) -> Any:
         return self.model
 
-    def _refit(self, params: dict[str, Any]) -> Any:
+    def _refit(
+        self,
+        params: dict[str, Any],
+        memory_log: bool = False,
+        memory_interval: float = 0.05,
+    ) -> Any:
         train_dates = self._all_train_dates()
-        self.fitted_transform = self._fit_transform(train_dates)
-        train_src = self._src(train_dates, self.train_filters, self.fitted_transform, "final_train")
+        with self._memory_log(
+            f"_refit _fit_transform train_dates={train_dates}",
+            enabled=memory_log,
+            interval=memory_interval,
+        ):
+            self.fitted_transform = self._fit_transform(train_dates)
+        train_src = self._src(
+            train_dates, self.train_filters, self.fitted_transform, "final_train"
+        )
         model = self.adapter.build(params)
-        return self._fit_model(model, train_src, None, None)
+        with self._memory_log(
+            f"_refit _fit_model train_dates={train_dates}",
+            enabled=memory_log,
+            interval=memory_interval,
+        ):
+            return self._fit_model(model, train_src, None, None)
 
     def _fit_transform(self, dates: Sequence[str]) -> Transform:
         key = tuple(dates)
         if key not in self._transform_cache:
             src = self._src(dates, self.train_filters, None, "fit")
             transform = copy.deepcopy(self.transform)
-            self._transform_cache[key] = transform.fit(src.frame(select=False))
+            self._transform_cache[key] = transform.fit(src)
         return self._transform_cache[key]
 
     def _src(
@@ -196,9 +277,13 @@ class Pipeline:
             cache_key=key,
         )
 
-    def _fit_model(self, model: Any, train: DataSource, val: DataSource | None, trial: Any | None) -> Any:
+    def _fit_model(
+        self, model: Any, train: DataSource, val: DataSource | None, trial: Any | None
+    ) -> Any:
         sig = inspect.signature(self.adapter.fit)
-        accepts_trial = "trial" in sig.parameters or any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
+        accepts_trial = "trial" in sig.parameters or any(
+            p.kind == p.VAR_KEYWORD for p in sig.parameters.values()
+        )
         if accepts_trial:
             return self.adapter.fit(model, train, val, self.tracker, trial=trial)
         return self.adapter.fit(model, train, val, self.tracker)
@@ -215,14 +300,26 @@ class Pipeline:
             x, y_true, ctx = src.materialize()
             y_pred = self.adapter.predict(model, x)
             ctx["fold"] = fold
-            return self._score(score, y_true, y_pred, ctx), ctx, y_pred if keep_predictions else None
+            return (
+                self._score(score, y_true, y_pred, ctx),
+                ctx,
+                y_pred if keep_predictions else None,
+            )
         loss, ctx, y_pred = self._score_stream(model, score, src, keep_predictions)
         ctx["fold"] = fold
         return loss, ctx, y_pred
 
-    def _score(self, score: Callable[..., float], y_true: np.ndarray, y_pred: np.ndarray, ctx: dict[str, Any]) -> float:
+    def _score(
+        self,
+        score: Callable[..., float],
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        ctx: dict[str, Any],
+    ) -> float:
         if len(y_true) != len(y_pred):
-            raise ValueError(f"score length mismatch: y_true={len(y_true)}, y_pred={len(y_pred)}")
+            raise ValueError(
+                f"score length mismatch: y_true={len(y_true)}, y_pred={len(y_pred)}"
+            )
         return float(self._call_score(score, y_true, y_pred, ctx))
 
     def _score_stream(
@@ -239,8 +336,12 @@ class Pipeline:
         for x, y_true, batch_ctx in src.batches(self._adapter_batch_size()):
             y_pred = np.asarray(self.adapter.predict(model, x))
             if len(y_true) != len(y_pred):
-                raise ValueError(f"score length mismatch: y_true={len(y_true)}, y_pred={len(y_pred)}")
-            state = self._call_score(score, y_true, y_pred, batch_ctx, combine_with=state)
+                raise ValueError(
+                    f"score length mismatch: y_true={len(y_true)}, y_pred={len(y_pred)}"
+                )
+            state = self._call_score(
+                score, y_true, y_pred, batch_ctx, combine_with=state
+            )
             self._merge_ctx(ctx, batch_ctx)
             if pred_parts is not None:
                 pred_parts.append(y_pred)
@@ -262,10 +363,14 @@ class Pipeline:
         params = list(sig.parameters.values())
         has_varargs = any(p.kind == p.VAR_POSITIONAL for p in params)
         has_varkw = any(p.kind == p.VAR_KEYWORD for p in params)
-        positional = [p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+        positional = [
+            p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
         args: list[Any] = [y_true, y_pred]
         kwargs: dict[str, Any] = {}
-        if has_varargs or (len(positional) >= 3 and positional[2].name != "combine_with"):
+        if has_varargs or (
+            len(positional) >= 3 and positional[2].name != "combine_with"
+        ):
             args.append(ctx)
         elif "ctx" in sig.parameters:
             kwargs["ctx"] = ctx
@@ -286,11 +391,65 @@ class Pipeline:
                 values = [str(v) for v in np.asarray(batch[name]).tolist()]
             if values is not None:
                 key = f"{name}s"
-                total[key] = _ordered_unique([*total.get(key, []), *[str(v) for v in values]])
+                total[key] = _ordered_unique(
+                    [*total.get(key, []), *[str(v) for v in values]]
+                )
 
     def _all_train_dates(self) -> list[str]:
         return [date for chunk in self.rolling_dates for date in chunk]
 
+    @contextmanager
+    def _memory_log(
+        self,
+        label: str,
+        enabled: bool = False,
+        interval: float = 0.05,
+    ):
+        if not enabled:
+            yield
+            return
+
+        try:
+            import psutil
+        except ImportError as exc:
+            raise ImportError("memory_log=True requires psutil.") from exc
+
+        proc = psutil.Process()
+        gc.collect()
+        start = proc.memory_info().rss
+        peak = start
+        running = True
+
+        def poll() -> None:
+            nonlocal peak
+            while running:
+                peak = max(peak, proc.memory_info().rss)
+                time.sleep(interval)
+
+        thread = threading.Thread(target=poll, daemon=True)
+        thread.start()
+        t0 = time.perf_counter()
+        print(f"[mem] {label}: start rss={_gb(start):.2f} GB", flush=True)
+        try:
+            yield
+        finally:
+            running = False
+            thread.join()
+            end = proc.memory_info().rss
+            maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+            print(
+                f"[mem] {label}: end rss={_gb(end):.2f} GB, "
+                f"delta={_gb(end - start):+.2f} GB, "
+                f"peak={_gb(peak):.2f} GB, "
+                f"ru_maxrss={_gb(maxrss):.2f} GB, "
+                f"time={time.perf_counter() - t0:.1f}s",
+                flush=True,
+            )
+
 
 def _ordered_unique(values: Sequence[str]) -> list[str]:
     return list(dict.fromkeys(values))
+
+
+def _gb(n_bytes: int) -> float:
+    return n_bytes / 1024**3

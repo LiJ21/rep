@@ -25,4 +25,6 @@ package = false
 [dependency-groups]
 dev = [
     "ipykernel>=7.3.0",
+    "jupyter-resource-usage>=1.2.1",
+    "jupyterlab>=4.6.0",
 ]

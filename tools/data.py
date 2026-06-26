@@ -150,6 +150,27 @@ class DataSource:
     def count(self) -> int:
         return int(self.frame().select(pl.len()).collect(engine="streaming").item())
 
+    def with_transform(self, transform: Any) -> "DataSource":
+        from tools.transform import compose_transform
+
+        cache_key = (
+            (*self.cache_key, "transform", id(transform))
+            if self.cache_key is not None
+            else None
+        )
+        out = DataSource(
+            dates=list(self.dates),
+            loader=self.loader,
+            target=self.target,
+            features=list(self.features),
+            filters=self.filters,
+            transform=compose_transform(self.transform, transform),
+            cache=self.cache,
+            cache_key=cache_key,
+        )
+        out._frames = self._frames
+        return out
+
     def _prepare(self, item: DateFrame, cols: Sequence[str] | None = None, select: bool = True) -> pl.LazyFrame:
         lf = item.lf.with_columns(
             pl.lit(item.date).alias("date"),

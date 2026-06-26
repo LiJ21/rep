@@ -8,7 +8,7 @@ import polars as pl
 from tools.features import Frame, LOBFeatures
 
 
-__all__ = ["add_future_executable_price", "add_future_price"]
+__all__ = ["add_executable_return", "add_future_executable_price", "add_future_price", "add_return"]
 
 _DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h|d|w)")
 _NS = {"ns": 1, "us": 1_000, "µs": 1_000, "ms": 1_000_000, "s": 1_000_000_000}
@@ -90,6 +90,44 @@ def add_future_executable_price(
     by: Sequence[str] = ("publisher_id", "instrument_id"),
 ) -> Frame:
     return add_future_price(
+        df,
+        LOBFeatures.size_weighted_avg_price(depth, total_size),
+        horizons,
+        weights,
+        time,
+        name,
+        by,
+    )
+
+
+def add_return(
+    df: Frame,
+    expr: pl.Expr,
+    horizons: Sequence[str] | str,
+    weights: Sequence[float] | float = 1.0,
+    time: str = "ts_event",
+    name: str = "return_bps",
+    by: Sequence[str] = ("publisher_id", "instrument_id"),
+) -> Frame:
+    lazy = isinstance(df, pl.LazyFrame)
+    out = add_future_price(df, expr, horizons, weights, time, "__future_price", by).lazy()
+    out = out.with_columns(expr.cast(pl.Float64).alias("__price"))
+    out = out.with_columns(((pl.col("__future_price") / pl.col("__price") - 1.0) * 10_000).alias(name))
+    out = out.drop("__future_price", "__price")
+    return out if lazy else out.collect(engine="streaming")
+
+
+def add_executable_return(
+    df: Frame,
+    depth: int,
+    total_size: float,
+    horizons: Sequence[str] | str,
+    weights: Sequence[float] | float = 1.0,
+    time: str = "ts_event",
+    name: str = "executable_return_bps",
+    by: Sequence[str] = ("publisher_id", "instrument_id"),
+) -> Frame:
+    return add_return(
         df,
         LOBFeatures.size_weighted_avg_price(depth, total_size),
         horizons,

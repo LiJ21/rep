@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Callable, Iterator, Sequence
+import inspect
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -166,14 +167,12 @@ class DataSource:
 
 class Raw:
     @classmethod
-    def load_date(
+    def resolve_path(
         cls,
         d: str,
         prod: str,
         path: str = RAW_PATH,
-        filters: Sequence[pl.Expr] = (),
-        cols: Sequence[str] | None = None,
-    ) -> DateFrame:
+    ) -> tuple[str, str]:
         pattern = path.format(
             prod=prod,
             prod_s=prod.lower(),
@@ -201,7 +200,19 @@ class Raw:
             )
 
         fname, tag = matched[0]
-        lf = pl.scan_parquet(os.path.join(d_dir, fname))
+        return os.path.join(d_dir, fname), tag
+
+    @classmethod
+    def load_date(
+        cls,
+        d: str,
+        prod: str,
+        path: str = RAW_PATH,
+        filters: Sequence[pl.Expr] = (),
+        cols: Sequence[str] | None = None,
+    ) -> DateFrame:
+        fpath, tag = cls.resolve_path(d, prod, path)
+        lf = pl.scan_parquet(fpath)
         if filters:
             lf = lf.filter(_mask(filters))
         if cols is not None:
@@ -211,3 +222,113 @@ class Raw:
     @classmethod
     def load_dates(cls, dates: str | Sequence[str], prod: str, **kwargs: Any) -> list[DateFrame]:
         return [cls.load_date(d, prod, **kwargs) for d in _as_dates(dates)]
+
+
+@dataclass
+class FeatureLoader:
+    prod: str | None = None
+    feature_exprs: Mapping[str, pl.Expr] = field(default_factory=dict)
+    return_exprs: Mapping[str, pl.Expr] = field(default_factory=dict)
+    executable_returns: Mapping[str, tuple[int, float]] = field(default_factory=dict)
+    horizons: Sequence[str] | str = "1s"
+    weights: Sequence[float] | float = 1.0
+    l2_depth: int | None = None
+    path: str = RAW_PATH
+    filters: tuple[pl.Expr, ...] = ()
+    context_cols: tuple[str, ...] = ("ts_event", "ts_recv", "symbol")
+    meta_cols: tuple[str, ...] | None = None
+    batch_size: int = 65_536
+    return_time: str = "ts_event"
+    return_by: tuple[str, ...] = ("publisher_id", "instrument_id")
+
+    def __call__(self, dates: str | Sequence[str], prod: str | None = None) -> list[DateFrame]:
+        return self.load_dates(dates, prod=prod)
+
+    def load_dates(self, dates: str | Sequence[str], prod: str | None = None) -> list[DateFrame]:
+        p = prod or self.prod
+        if p is None:
+            raise ValueError("FeatureLoader needs prod either at construction or call time")
+        return [self.load_date(d, p) for d in _as_dates(dates)]
+
+    def load_date(self, d: str, prod: str | None = None) -> DateFrame:
+        from tools.features import mbo_to_features
+        from tools.price import add_executable_return, add_return
+
+        p = prod or self.prod
+        if p is None:
+            raise ValueError("FeatureLoader needs prod either at construction or call time")
+        fpath, tag = Raw.resolve_path(d, p, self.path)
+
+        if self.l2_depth is None:
+            raw = pl.scan_parquet(fpath)
+            lf = mbo_to_features(raw, self.feature_exprs, self.filters, context_cols=self.context_cols)
+        else:
+            parts = mbo_to_features(
+                fpath,
+                self.feature_exprs,
+                self.filters,
+                l2_depth=self.l2_depth,
+                context_cols=self.context_cols,
+                batch_size=self.batch_size,
+            )
+            lf = pl.concat(list(parts), how="vertical_relaxed").lazy()
+
+        for name, expr in self.return_exprs.items():
+            lf = add_return(lf, expr, self.horizons, self.weights, self.return_time, name, self.return_by)
+        for name, (depth, total_size) in self.executable_returns.items():
+            lf = add_executable_return(lf, depth, total_size, self.horizons, self.weights, self.return_time, name, self.return_by)
+        if self.meta_cols is not None:
+            cols = [*self.meta_cols, *self.feature_exprs, *self.return_exprs, *self.executable_returns]
+            lf = lf.select(_ordered_unique(cols))
+        return DateFrame(date=d, nature=_nature_from_tag(tag), lf=lf)
+
+
+@dataclass
+class MultiProductLoader:
+    products: Sequence[str]
+    loader: Any
+    on: tuple[str, ...] = ("ts_event",)
+    forward_fill: bool = True
+    dedup_on: bool = True
+    prefix_sep: str = "__"
+
+    def __call__(self, dates: str | Sequence[str]) -> list[DateFrame]:
+        return self.load_dates(dates)
+
+    def load_dates(self, dates: str | Sequence[str]) -> list[DateFrame]:
+        ds = _as_dates(dates)
+        loaded = {prod: _load_product(self.loader, ds, prod) for prod in self.products}
+        by_prod = {prod: {item.date: item for item in frames} for prod, frames in loaded.items()}
+        return [self._join_date(d, by_prod) for d in ds]
+
+    def _join_date(self, d: str, by_prod: Mapping[str, Mapping[str, DateFrame]]) -> DateFrame:
+        items = [by_prod[prod][d] for prod in self.products]
+        frames = [
+            _prefix_non_keys(_dedup_on(item.lf, self.on) if self.dedup_on else item.lf, prod, self.on, self.prefix_sep)
+            for prod, item in zip(self.products, items)
+        ]
+        lf = frames[0]
+        for other in frames[1:]:
+            lf = lf.join(other, on=list(self.on), how="full", coalesce=True)
+        lf = lf.sort(list(self.on))
+        if self.forward_fill:
+            lf = lf.with_columns(pl.all().exclude(self.on).forward_fill())
+        nature = "+".join(_ordered_unique([item.nature for item in items]))
+        return DateFrame(date=d, nature=nature, lf=lf)
+
+
+def _load_product(loader: Any, dates: Sequence[str], prod: str) -> list[DateFrame]:
+    fn = loader.load_dates if hasattr(loader, "load_dates") else loader
+    sig = inspect.signature(fn)
+    accepts_prod = "prod" in sig.parameters or any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
+    return fn(dates, prod=prod) if accepts_prod else fn(dates)
+
+
+def _prefix_non_keys(lf: pl.LazyFrame, prod: str, keys: Sequence[str], sep: str) -> pl.LazyFrame:
+    key_set = set(keys)
+    prefix = f"{prod.lower()}{sep}"
+    return lf.rename({c: f"{prefix}{c}" for c in lf.collect_schema().names() if c not in key_set})
+
+
+def _dedup_on(lf: pl.LazyFrame, keys: Sequence[str]) -> pl.LazyFrame:
+    return lf.sort(list(keys)).group_by(list(keys), maintain_order=True).last()

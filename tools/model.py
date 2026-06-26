@@ -27,7 +27,7 @@ class ModelAdapter(Protocol):
         trial: Any | None = None,
     ) -> Any: ...
 
-    def predict(self, model: Any, src: "DataSource") -> np.ndarray: ...
+    def predict(self, model: Any, x: np.ndarray) -> np.ndarray: ...
 
 
 @dataclass
@@ -55,11 +55,10 @@ class DummyAdapter:
             model["mean"] = float(np.mean(y)) if len(y) else 0.0
         return model
 
-    def predict(self, model: dict[str, Any], src: "DataSource") -> np.ndarray:
-        x, y, _ = src.materialize()
+    def predict(self, model: dict[str, Any], x: np.ndarray) -> np.ndarray:
         if "coef" in model:
             return np.asarray(model["intercept"] + x @ model["coef"])
-        return np.full(len(y), model.get("mean", 0.0), dtype=float)
+        return np.full(len(x), model.get("mean", 0.0), dtype=float)
 
 
 @dataclass
@@ -121,11 +120,8 @@ class XGBoostAdapter:
                     tracker.log({f"xgb/{name}_{metric}": values[-1]})
         return booster
 
-    def predict(self, model: Any, src: "DataSource") -> np.ndarray:
-        preds = []
-        for x, _, _ in src.batches(self.batch_size):
-            preds.append(np.asarray(model.inplace_predict(x)))
-        return np.concatenate(preds) if preds else np.array([], dtype=float)
+    def predict(self, model: Any, x: np.ndarray) -> np.ndarray:
+        return np.asarray(model.inplace_predict(x))
 
     def _dmatrix(self, xgb: Any, src: "DataSource", ref: Any | None = None) -> Any:
         if not self.streaming:
@@ -155,31 +151,220 @@ class XGBoostAdapter:
 
 @dataclass
 class LarsAdapter:
-    kind: str = "lasso_lars"
-    streaming: bool = False
+    alpha: float = 1.0
+    method: str = "lasso"
+    fit_intercept: bool = True
+    max_iter: int = 500
+    alpha_min: float = 0.0
+    eps: float = float(np.finfo(float).eps)
+    positive: bool = False
+    batch_size: int | None = 200_000
+    max_features: int | None = None
+    streaming: bool = True
+    cache_path: bool = True
+    _stats_cache: dict[Any, "_LarsStats"] = field(default_factory=dict, init=False, repr=False)
+    _path_cache: dict[Any, tuple[np.ndarray, list[int], np.ndarray]] = field(default_factory=dict, init=False, repr=False)
 
-    def build(self, params: dict[str, Any]) -> Any:
-        try:
-            from sklearn import linear_model
-        except ImportError as exc:
-            raise ImportError("LarsAdapter requires scikit-learn.") from exc
-        cls = linear_model.Lars if self.kind == "lars" else linear_model.LassoLars
-        return cls(**params)
+    def build(self, params: dict[str, Any]) -> "LarsPathModel":
+        cfg = {
+            "alpha": self.alpha,
+            "method": self.method,
+            "fit_intercept": self.fit_intercept,
+            "max_iter": self.max_iter,
+            "alpha_min": self.alpha_min,
+            "eps": self.eps,
+            "positive": self.positive,
+            **params,
+        }
+        known = {"alpha", "method", "fit_intercept", "max_iter", "alpha_min", "eps", "positive"}
+        unknown = set(cfg) - known
+        if unknown:
+            raise ValueError(f"unsupported LarsAdapter params: {sorted(unknown)}")
+        return LarsPathModel(
+            alpha=float(cfg["alpha"]),
+            method=str(cfg["method"]),
+            fit_intercept=bool(cfg["fit_intercept"]),
+            max_iter=int(cfg["max_iter"]),
+            alpha_min=float(cfg["alpha_min"]),
+            eps=float(cfg["eps"]),
+            positive=bool(cfg["positive"]),
+            params=dict(params),
+        )
 
     def fit(
         self,
-        model: Any,
+        model: "LarsPathModel",
         train: "DataSource",
         val: "DataSource | None",
         tracker: "Tracker",
         trial: Any | None = None,
-    ) -> Any:
-        x, y, _ = train.materialize()
-        return model.fit(x, y)
+    ) -> "LarsPathModel":
+        try:
+            from sklearn.linear_model import lars_path_gram
+        except ImportError as exc:
+            raise ImportError("LarsAdapter requires scikit-learn.") from exc
 
-    def predict(self, model: Any, src: "DataSource") -> np.ndarray:
-        x, _, _ = src.materialize()
-        return np.asarray(model.predict(x))
+        stats = self._stats(train)
+        gram, xy, x_mean, y_mean = stats.centered(model.fit_intercept)
+        key = self._path_key(train, model)
+        cached = self._path_cache.get(key) if key is not None else None
+        if cached is None:
+            alphas, active, coefs_path = lars_path_gram(
+                xy,
+                gram,
+                n_samples=stats.n,
+                method=model.method,
+                max_iter=model.max_iter,
+                alpha_min=model.alpha_min,
+                eps=model.eps,
+                positive=model.positive,
+                return_path=True,
+            )
+            cached = (np.asarray(alphas), [int(i) for i in active], np.asarray(coefs_path))
+            if key is not None:
+                self._path_cache[key] = cached
+        model.alphas, model.active, model.coefs_path = cached
+        model.n_samples = stats.n
+        model.x_mean = x_mean
+        model.y_mean = y_mean
+        model.coef = self._coef_at(model.alphas, model.coefs_path, model.alpha)
+        model.intercept = float(y_mean - x_mean @ model.coef) if model.fit_intercept else 0.0
+        if tracker is not None:
+            tracker.log(
+                {
+                    "lars/alpha": model.alpha,
+                    "lars/path_len": len(model.alphas),
+                    "lars/n": stats.n,
+                    "lars/n_features": stats.n_features,
+                }
+            )
+        return model
+
+    def predict(self, model: "LarsPathModel", x: np.ndarray) -> np.ndarray:
+        return model.predict(x)
+
+    def path(self, model: "LarsPathModel") -> dict[str, Any]:
+        if model.alphas is None or model.coefs_path is None:
+            raise RuntimeError("LARS path is not available before fit()")
+        return {
+            "alphas": model.alphas.copy(),
+            "active": list(model.active),
+            "coefs_path": model.coefs_path.copy(),
+        }
+
+    def _stats(self, src: "DataSource") -> "_LarsStats":
+        key = self._stats_key(src)
+        if key is not None and key in self._stats_cache:
+            return self._stats_cache[key]
+
+        stats: _LarsStats | None = None
+        for x, y, _ in src.batches(self.batch_size):
+            x = np.asarray(x, dtype=float)
+            y = np.asarray(y, dtype=float).reshape(-1)
+            if len(y) == 0:
+                continue
+            if stats is None:
+                if self.max_features is not None and x.shape[1] > self.max_features:
+                    raise MemoryError(f"LarsAdapter got {x.shape[1]} features; max_features={self.max_features}")
+                stats = _LarsStats.empty(x.shape[1])
+            stats.add(x, y)
+
+        if stats is None or stats.n == 0:
+            raise ValueError("cannot fit LarsAdapter on empty data")
+        if key is not None:
+            self._stats_cache[key] = stats
+        return stats
+
+    def _stats_key(self, src: "DataSource") -> Any | None:
+        key = getattr(src, "cache_key", None)
+        if key is None:
+            return None
+        return (key, tuple(src.features), src.target)
+
+    def _path_key(self, src: "DataSource", model: "LarsPathModel") -> Any | None:
+        key = self._stats_key(src)
+        if not self.cache_path or key is None:
+            return None
+        return (key, model.method, model.fit_intercept, model.max_iter, model.alpha_min, model.eps, model.positive)
+
+    @staticmethod
+    def _coef_at(alphas: np.ndarray, coefs_path: np.ndarray, alpha: float) -> np.ndarray:
+        if len(alphas) == 1:
+            return coefs_path[:, 0].copy()
+        if alpha < alphas[-1]:
+            warnings.warn(
+                f"alpha={alpha} is below computed path minimum {alphas[-1]}; using path endpoint.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        xp = alphas[::-1]
+        return np.array([np.interp(alpha, xp, row[::-1]) for row in coefs_path], dtype=float)
+
+
+@dataclass
+class LarsPathModel:
+    alpha: float
+    method: str = "lasso"
+    fit_intercept: bool = True
+    max_iter: int = 500
+    alpha_min: float = 0.0
+    eps: float = float(np.finfo(float).eps)
+    positive: bool = False
+    params: dict[str, Any] = field(default_factory=dict)
+    coef: np.ndarray | None = None
+    intercept: float = 0.0
+    alphas: np.ndarray | None = None
+    active: list[int] = field(default_factory=list)
+    coefs_path: np.ndarray | None = None
+    n_samples: int = 0
+    x_mean: np.ndarray | None = None
+    y_mean: float = 0.0
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        if self.coef is None:
+            raise RuntimeError("LarsPathModel is not fitted")
+        return np.asarray(x, dtype=float) @ self.coef + self.intercept
+
+
+@dataclass
+class _LarsStats:
+    xtx: np.ndarray
+    xty: np.ndarray
+    x_sum: np.ndarray
+    y_sum: float = 0.0
+    n: int = 0
+
+    @classmethod
+    def empty(cls, n_features: int) -> "_LarsStats":
+        return cls(
+            xtx=np.zeros((n_features, n_features), dtype=float),
+            xty=np.zeros(n_features, dtype=float),
+            x_sum=np.zeros(n_features, dtype=float),
+        )
+
+    @property
+    def n_features(self) -> int:
+        return int(self.x_sum.size)
+
+    def add(self, x: np.ndarray, y: np.ndarray) -> None:
+        if x.shape[0] != len(y):
+            raise ValueError(f"batch length mismatch: X={x.shape[0]} y={len(y)}")
+        if x.shape[1] != self.n_features:
+            raise ValueError(f"feature count changed: expected {self.n_features}, got {x.shape[1]}")
+        self.xtx += x.T @ x
+        self.xty += x.T @ y
+        self.x_sum += x.sum(axis=0)
+        self.y_sum += float(y.sum())
+        self.n += len(y)
+
+    def centered(self, fit_intercept: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        if not fit_intercept:
+            return self.xtx.copy(), self.xty.copy(), np.zeros(self.n_features), 0.0
+        x_mean = self.x_sum / self.n
+        y_mean = self.y_sum / self.n
+        gram = self.xtx - np.outer(self.x_sum, self.x_sum) / self.n
+        xy = self.xty - self.x_sum * y_mean
+        return gram, xy, x_mean, float(y_mean)
 
 
 @dataclass
@@ -234,16 +419,14 @@ class TorchAdapter:
             tracker.log(metrics, step=epoch)
         return model
 
-    def predict(self, model: Any, src: "DataSource") -> np.ndarray:
+    def predict(self, model: Any, x: np.ndarray) -> np.ndarray:
         import torch
 
         device = next(model.parameters()).device
         model.eval()
-        preds = []
         with torch.inference_mode():
-            for xb, _ in self._loader(torch, src, 0, 1):
-                preds.append(model(xb.to(device)).detach().cpu().numpy().reshape(-1))
-        return np.concatenate(preds) if preds else np.array([], dtype=float)
+            xb = torch.as_tensor(x, dtype=torch.float32, device=device)
+            return model(xb).detach().cpu().numpy().reshape(-1)
 
     def _loader(self, torch: Any, src: "DataSource", rank: int, world_size: int):
         batch_size = self.batch_size

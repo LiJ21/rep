@@ -23,11 +23,35 @@ from tools.track import NullTracker, Tracker
 from tools.transform import Passthrough, Transform
 
 
-Score = Callable[[np.ndarray, np.ndarray, dict[str, Any] | None], float]
+Score = Callable[..., float]
+_NO_COMBINE = object()
 
 
-def rmse(y_true: np.ndarray, y_pred: np.ndarray, ctx: dict[str, Any] | None = None) -> float:
-    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+@dataclass(frozen=True)
+class ScoreValue:
+    value: float
+    n: int
+    state: dict[str, Any] = field(default_factory=dict)
+
+    def __float__(self) -> float:
+        return self.value
+
+
+def rmse(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    ctx: dict[str, Any] | None = None,
+    combine_with: Any = _NO_COMBINE,
+) -> float | ScoreValue:
+    err = np.asarray(y_true) - np.asarray(y_pred)
+    sse = float(np.dot(err, err))
+    n = int(len(err))
+    if combine_with is _NO_COMBINE:
+        return float(np.sqrt(sse / n)) if n else 0.0
+    if combine_with is not None:
+        sse += float(getattr(combine_with, "state", {}).get("sse", 0.0))
+        n += int(getattr(combine_with, "n", 0))
+    return ScoreValue(float(np.sqrt(sse / n)) if n else 0.0, n, {"sse": sse})
 
 
 @dataclass
@@ -86,10 +110,7 @@ class Pipeline:
                     val_src = self._src(val_dates, self.val_filters, fitted, "val")
                     model = self.adapter.build(params)
                     model = self._fit_model(model, train_src, val_src, trial)
-                    y_pred = self.adapter.predict(model, val_src)
-                    y_true, ctx = val_src.labels()
-                    ctx["fold"] = fold
-                    loss = self._score(self.val_score, y_true, y_pred, ctx)
+                    loss, ctx, _ = self._evaluate(model, val_src, self.val_score, fold)
                     scores.append(loss)
                     sizes.append(int(ctx["n"]))
                     running = weighted_mean(scores, sizes, self.fold_weighting)
@@ -135,10 +156,7 @@ class Pipeline:
             raise RuntimeError("call train() before test()")
         transform = self.fitted_transform or self._fit_transform(self._all_train_dates())
         src = self._src(self.test_dates, self.test_filters, transform, "test")
-        y_pred = self.adapter.predict(self.model, src)
-        y_true, ctx = src.labels()
-        ctx["fold"] = "test"
-        loss = self._score(self.test_score, y_true, y_pred, ctx)
+        loss, ctx, y_pred = self._evaluate(self.model, src, self.test_score, "test", keep_predictions=True)
         return {"test_score": loss, "n": int(ctx["n"]), "ctx": ctx, "y_pred": y_pred}
 
     def get_model(self) -> Any:
@@ -185,12 +203,94 @@ class Pipeline:
             return self.adapter.fit(model, train, val, self.tracker, trial=trial)
         return self.adapter.fit(model, train, val, self.tracker)
 
+    def _evaluate(
+        self,
+        model: Any,
+        src: DataSource,
+        score: Callable[..., float],
+        fold: Any,
+        keep_predictions: bool = False,
+    ) -> tuple[float, dict[str, Any], np.ndarray | None]:
+        if not getattr(self.adapter, "streaming", False):
+            x, y_true, ctx = src.materialize()
+            y_pred = self.adapter.predict(model, x)
+            ctx["fold"] = fold
+            return self._score(score, y_true, y_pred, ctx), ctx, y_pred if keep_predictions else None
+        loss, ctx, y_pred = self._score_stream(model, score, src, keep_predictions)
+        ctx["fold"] = fold
+        return loss, ctx, y_pred
+
     def _score(self, score: Callable[..., float], y_true: np.ndarray, y_pred: np.ndarray, ctx: dict[str, Any]) -> float:
         if len(y_true) != len(y_pred):
             raise ValueError(f"score length mismatch: y_true={len(y_true)}, y_pred={len(y_pred)}")
+        return float(self._call_score(score, y_true, y_pred, ctx))
+
+    def _score_stream(
+        self,
+        model: Any,
+        score: Callable[..., float],
+        src: DataSource,
+        keep_predictions: bool = False,
+    ) -> tuple[float, dict[str, Any], np.ndarray | None]:
+        state: Any = None
+        ctx: dict[str, Any] = {"n": 0}
+        pred_parts = [] if keep_predictions else None
+
+        for x, y_true, batch_ctx in src.batches(self._adapter_batch_size()):
+            y_pred = np.asarray(self.adapter.predict(model, x))
+            if len(y_true) != len(y_pred):
+                raise ValueError(f"score length mismatch: y_true={len(y_true)}, y_pred={len(y_pred)}")
+            state = self._call_score(score, y_true, y_pred, batch_ctx, combine_with=state)
+            self._merge_ctx(ctx, batch_ctx)
+            if pred_parts is not None:
+                pred_parts.append(y_pred)
+
+        if state is None:
+            raise ValueError("cannot score empty prediction stream")
+        y_pred = np.concatenate(pred_parts) if pred_parts else None
+        return float(state), ctx, y_pred
+
+    def _call_score(
+        self,
+        score: Callable[..., float],
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        ctx: dict[str, Any],
+        combine_with: Any = _NO_COMBINE,
+    ) -> Any:
         sig = inspect.signature(score)
-        accepts_ctx = any(p.kind == p.VAR_POSITIONAL for p in sig.parameters.values()) or len(sig.parameters) >= 3
-        return float(score(y_true, y_pred, ctx) if accepts_ctx else score(y_true, y_pred))
+        params = list(sig.parameters.values())
+        has_varargs = any(p.kind == p.VAR_POSITIONAL for p in params)
+        has_varkw = any(p.kind == p.VAR_KEYWORD for p in params)
+        positional = [p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+        args: list[Any] = [y_true, y_pred]
+        kwargs: dict[str, Any] = {}
+        if has_varargs or (len(positional) >= 3 and positional[2].name != "combine_with"):
+            args.append(ctx)
+        elif "ctx" in sig.parameters:
+            kwargs["ctx"] = ctx
+        if combine_with is not _NO_COMBINE:
+            if "combine_with" not in sig.parameters and not has_varkw:
+                raise TypeError("streaming scores must accept a combine_with argument")
+            kwargs["combine_with"] = combine_with
+        return score(*args, **kwargs)
+
+    def _adapter_batch_size(self) -> int | None:
+        return getattr(self.adapter, "batch_size", None)
+
+    def _merge_ctx(self, total: dict[str, Any], batch: dict[str, Any]) -> None:
+        total["n"] = int(total.get("n", 0)) + int(batch.get("n", 0))
+        for name in ("date", "nature"):
+            values = batch.get(f"{name}s")
+            if values is None and name in batch:
+                values = [str(v) for v in np.asarray(batch[name]).tolist()]
+            if values is not None:
+                key = f"{name}s"
+                total[key] = _ordered_unique([*total.get(key, []), *[str(v) for v in values]])
 
     def _all_train_dates(self) -> list[str]:
         return [date for chunk in self.rolling_dates for date in chunk]
+
+
+def _ordered_unique(values: Sequence[str]) -> list[str]:
+    return list(dict.fromkeys(values))

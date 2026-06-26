@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
+from datetime import timedelta
+from math import isfinite
+from numbers import Real
 from pathlib import Path
 
 import polars as pl
@@ -12,6 +15,7 @@ from tools.orderbook import depth_batches, depth_table_from_arrow
 UNDEF_PRICE = 9_223_372_036_854_775_807
 Frame = pl.DataFrame | pl.LazyFrame
 Source = Frame | str | Path
+HalfLife = str | timedelta | int | float
 __all__ = [
     "LOBFeatures",
     "add_features",
@@ -57,20 +61,48 @@ class LOBFeatures:
         return LOBFeatures._diff(bid, ask, log, eps)
 
     @staticmethod
-    def trade_momentum(alpha: float, log: bool = False, eps: float = 1e-12) -> pl.Expr:
+    def ewma(feature: pl.Expr, half_life: HalfLife, time: str = "ts_event") -> pl.Expr:
+        return feature.cast(pl.Float64).ewm_mean_by(
+            pl.col(time),
+            half_life=LOBFeatures._half_life(half_life),
+        )
+
+    @staticmethod
+    def trade_momentum(
+        half_life: HalfLife,
+        log: bool = False,
+        eps: float = 1e-12,
+        time: str = "ts_event",
+    ) -> pl.Expr:
         buy = (
             pl.when(pl.col("trade_side") == 0)
             .then(pl.col("trade_sz").cast(pl.Float64))
             .otherwise(0.0)
-            .ewm_mean(alpha=alpha, adjust=False)
         )
         sell = (
             pl.when(pl.col("trade_side") == 1)
             .then(pl.col("trade_sz").cast(pl.Float64))
             .otherwise(0.0)
-            .ewm_mean(alpha=alpha, adjust=False)
         )
+        buy = LOBFeatures.ewma(buy, half_life, time)
+        sell = LOBFeatures.ewma(sell, half_life, time)
         return LOBFeatures._diff(buy, sell, log, eps)
+
+    @staticmethod
+    def _half_life(half_life: HalfLife) -> str | timedelta:
+        if isinstance(half_life, bool):
+            raise TypeError("half_life must be a duration string, timedelta, or positive seconds")
+        if isinstance(half_life, Real):
+            seconds = float(half_life)
+            if not isfinite(seconds) or seconds <= 0:
+                raise ValueError("numeric half_life is in seconds and must be positive")
+            ns = round(seconds * 1_000_000_000)
+            if ns <= 0:
+                raise ValueError("numeric half_life is in seconds and must be at least 0.5ns")
+            return f"{ns}ns"
+        if isinstance(half_life, (str, timedelta)):
+            return half_life
+        raise TypeError("half_life must be a duration string, timedelta, or positive seconds")
 
     @staticmethod
     def size_weighted_price_gap(

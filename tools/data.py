@@ -13,7 +13,6 @@ import exchange_calendars as ec
 import numpy as np
 import polars as pl
 
-
 _HOLIDAY_CALENDARS = {"cme": "CMES"}
 _ROOT = Path(__file__).resolve().parents[1]
 RAW_PATH = str(
@@ -38,7 +37,12 @@ Batch = tuple[np.ndarray, np.ndarray, dict[str, Any]]
 POLARS_ENGINES = {"auto", "streaming", "gpu"}
 
 
-def expand_dates(dates: str, exclude_holiday: str | None = "cme", str_result: bool = True, end_date: bool = True):
+def expand_dates(
+    dates: str,
+    exclude_holiday: str | None = "cme",
+    str_result: bool = True,
+    end_date: bool = True,
+):
     parts = dates.split("-")
     start = datetime.strptime(parts[0], "%Y%m%d").date()
     end = datetime.strptime(parts[-1], "%Y%m%d").date()
@@ -55,8 +59,8 @@ def expand_dates(dates: str, exclude_holiday: str | None = "cme", str_result: bo
         sessions = set(ec.get_calendar(cal).sessions_in_range(start, end).date)
         days = [d for d in days if d in sessions]
 
-    end = len(days) if end_date else -1
-    days = days[:end]
+    if not end_date:
+        days = [d for d in days if d != end]
     return [d.isoformat() for d in days] if str_result else days
 
 
@@ -137,7 +141,11 @@ class DataSource:
         return pl.concat(frames, how="vertical")
 
     def materialize(self) -> Batch:
-        if self.cache is not None and self.cache_key is not None and self.cache_key in self.cache:
+        if (
+            self.cache is not None
+            and self.cache_key is not None
+            and self.cache_key in self.cache
+        ):
             return self.cache[self.cache_key]
         batch = _to_batch(
             self.frame().collect(engine=self.polars_engine),
@@ -176,7 +184,9 @@ class DataSource:
         return df.get_column(self.target).to_numpy(), _ctx_from_df(df)
 
     def count(self) -> int:
-        return int(self.frame().select(pl.len()).collect(engine=self.polars_engine).item())
+        return int(
+            self.frame().select(pl.len()).collect(engine=self.polars_engine).item()
+        )
 
     def with_transform(self, transform: Any) -> "DataSource":
         from tools.transform import compose_transform
@@ -200,7 +210,9 @@ class DataSource:
         out._frames = self._frames
         return out
 
-    def _prepare(self, item: DateFrame, cols: Sequence[str] | None = None, select: bool = True) -> pl.LazyFrame:
+    def _prepare(
+        self, item: DateFrame, cols: Sequence[str] | None = None, select: bool = True
+    ) -> pl.LazyFrame:
         lf = item.lf.with_columns(
             pl.lit(item.date).alias("date"),
             pl.lit(item.nature).alias("nature"),
@@ -270,7 +282,9 @@ class Raw:
         return DateFrame(date=d, nature=_nature_from_tag(tag), lf=lf)
 
     @classmethod
-    def load_dates(cls, dates: str | Sequence[str], prod: str, **kwargs: Any) -> list[DateFrame]:
+    def load_dates(
+        cls, dates: str | Sequence[str], prod: str, **kwargs: Any
+    ) -> list[DateFrame]:
         return [cls.load_date(d, prod, **kwargs) for d in _as_dates(dates)]
 
 
@@ -291,13 +305,19 @@ class FeatureLoader:
     return_time: str = "ts_event"
     return_by: tuple[str, ...] = ("publisher_id", "instrument_id")
 
-    def __call__(self, dates: str | Sequence[str], prod: str | None = None) -> list[DateFrame]:
+    def __call__(
+        self, dates: str | Sequence[str], prod: str | None = None
+    ) -> list[DateFrame]:
         return self.load_dates(dates, prod=prod)
 
-    def load_dates(self, dates: str | Sequence[str], prod: str | None = None) -> list[DateFrame]:
+    def load_dates(
+        self, dates: str | Sequence[str], prod: str | None = None
+    ) -> list[DateFrame]:
         p = prod or self.prod
         if p is None:
-            raise ValueError("FeatureLoader needs prod either at construction or call time")
+            raise ValueError(
+                "FeatureLoader needs prod either at construction or call time"
+            )
         return [self.load_date(d, p) for d in _as_dates(dates)]
 
     def load_date(self, d: str, prod: str | None = None) -> DateFrame:
@@ -306,12 +326,16 @@ class FeatureLoader:
 
         p = prod or self.prod
         if p is None:
-            raise ValueError("FeatureLoader needs prod either at construction or call time")
+            raise ValueError(
+                "FeatureLoader needs prod either at construction or call time"
+            )
         fpath, tag = Raw.resolve_path(d, p, self.path)
 
         if self.l2_depth is None:
             raw = pl.scan_parquet(fpath)
-            lf = mbo_to_features(raw, self.feature_exprs, self.filters, context_cols=self.context_cols)
+            lf = mbo_to_features(
+                raw, self.feature_exprs, self.filters, context_cols=self.context_cols
+            )
         else:
             parts = mbo_to_features(
                 fpath,
@@ -324,11 +348,33 @@ class FeatureLoader:
             lf = pl.concat(list(parts), how="vertical_relaxed").lazy()
 
         for name, expr in self.return_exprs.items():
-            lf = add_return(lf, expr, self.horizons, self.weights, self.return_time, name, self.return_by)
+            lf = add_return(
+                lf,
+                expr,
+                self.horizons,
+                self.weights,
+                self.return_time,
+                name,
+                self.return_by,
+            )
         for name, (depth, total_size) in self.executable_returns.items():
-            lf = add_executable_return(lf, depth, total_size, self.horizons, self.weights, self.return_time, name, self.return_by)
+            lf = add_executable_return(
+                lf,
+                depth,
+                total_size,
+                self.horizons,
+                self.weights,
+                self.return_time,
+                name,
+                self.return_by,
+            )
         if self.meta_cols is not None:
-            cols = [*self.meta_cols, *self.feature_exprs, *self.return_exprs, *self.executable_returns]
+            cols = [
+                *self.meta_cols,
+                *self.feature_exprs,
+                *self.return_exprs,
+                *self.executable_returns,
+            ]
             lf = lf.select(_ordered_unique(cols))
         return DateFrame(date=d, nature=_nature_from_tag(tag), lf=lf)
 
@@ -348,13 +394,23 @@ class MultiProductLoader:
     def load_dates(self, dates: str | Sequence[str]) -> list[DateFrame]:
         ds = _as_dates(dates)
         loaded = {prod: _load_product(self.loader, ds, prod) for prod in self.products}
-        by_prod = {prod: {item.date: item for item in frames} for prod, frames in loaded.items()}
+        by_prod = {
+            prod: {item.date: item for item in frames}
+            for prod, frames in loaded.items()
+        }
         return [self._join_date(d, by_prod) for d in ds]
 
-    def _join_date(self, d: str, by_prod: Mapping[str, Mapping[str, DateFrame]]) -> DateFrame:
+    def _join_date(
+        self, d: str, by_prod: Mapping[str, Mapping[str, DateFrame]]
+    ) -> DateFrame:
         items = [by_prod[prod][d] for prod in self.products]
         frames = [
-            _prefix_non_keys(_dedup_on(item.lf, self.on) if self.dedup_on else item.lf, prod, self.on, self.prefix_sep)
+            _prefix_non_keys(
+                _dedup_on(item.lf, self.on) if self.dedup_on else item.lf,
+                prod,
+                self.on,
+                self.prefix_sep,
+            )
             for prod, item in zip(self.products, items)
         ]
         lf = frames[0]
@@ -370,14 +426,20 @@ class MultiProductLoader:
 def _load_product(loader: Any, dates: Sequence[str], prod: str) -> list[DateFrame]:
     fn = loader.load_dates if hasattr(loader, "load_dates") else loader
     sig = inspect.signature(fn)
-    accepts_prod = "prod" in sig.parameters or any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
+    accepts_prod = "prod" in sig.parameters or any(
+        p.kind == p.VAR_KEYWORD for p in sig.parameters.values()
+    )
     return fn(dates, prod=prod) if accepts_prod else fn(dates)
 
 
-def _prefix_non_keys(lf: pl.LazyFrame, prod: str, keys: Sequence[str], sep: str) -> pl.LazyFrame:
+def _prefix_non_keys(
+    lf: pl.LazyFrame, prod: str, keys: Sequence[str], sep: str
+) -> pl.LazyFrame:
     key_set = set(keys)
     prefix = f"{prod.lower()}{sep}"
-    return lf.rename({c: f"{prefix}{c}" for c in lf.collect_schema().names() if c not in key_set})
+    return lf.rename(
+        {c: f"{prefix}{c}" for c in lf.collect_schema().names() if c not in key_set}
+    )
 
 
 def _dedup_on(lf: pl.LazyFrame, keys: Sequence[str]) -> pl.LazyFrame:

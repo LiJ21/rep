@@ -13,7 +13,7 @@ import exchange_calendars as ec
 import numpy as np
 import polars as pl
 
-_HOLIDAY_CALENDARS = {"cme": "CMES"}
+_HOLIDAY_CALENDARS = {"cme": "CMES", "regular": "XNYS", "us": "XNYS"}
 _ROOT = Path(__file__).resolve().parents[1]
 RAW_PATH = str(
     _ROOT
@@ -39,7 +39,7 @@ POLARS_ENGINES = {"auto", "streaming", "gpu"}
 
 def expand_dates(
     dates: str,
-    exclude_holiday: str | None = "cme",
+    exclude_holiday: str | None = "regular",
     str_result: bool = True,
     end_date: bool = True,
 ):

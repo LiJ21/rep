@@ -4,12 +4,13 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, Int64Array, LargeStringArray, RecordBatch, StringArray, UInt16Array,
-    UInt32Array, UInt64Array, UInt8Array,
+    Array, ArrayRef, Int64Array, LargeStringArray, RecordBatch, StringArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
-use arrow_schema::{ArrowError, DataType, Field, Schema};
+use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::file::properties::WriterProperties;
@@ -57,6 +58,7 @@ pub struct Stats {
 
 #[derive(Clone, Copy)]
 pub struct Row {
+    pub ts_event: i64,
     pub row_nr: u64,
     pub sequence: u32,
     pub publisher_id: u16,
@@ -89,6 +91,7 @@ pub fn depth_schema(levels: usize) -> Arc<Schema> {
 
 pub fn read_rows_parquet(path: &str) -> Result<Vec<Row>, Box<dyn std::error::Error>> {
     const COLS: &[&str] = &[
+        "ts_event",
         "sequence",
         "publisher_id",
         "instrument_id",
@@ -125,6 +128,7 @@ where
         let c = InCols::new(&batch)?;
         for i in 0..batch.num_rows() {
             rows.push(Row {
+                ts_event: timestamp_ns_at(c.ts_event, i)?,
                 row_nr,
                 sequence: c.sequence.value(i),
                 publisher_id: c.publisher_id.value(i),
@@ -412,6 +416,7 @@ fn valid_side(side: u8) -> bool {
 struct OutBuffer {
     schema: Arc<Schema>,
     levels: usize,
+    ts_event: Vec<i64>,
     row_nr: Vec<u64>,
     sequence: Vec<u32>,
     publisher_id: Vec<u16>,
@@ -432,6 +437,7 @@ impl OutBuffer {
         Self {
             schema,
             levels,
+            ts_event: Vec::with_capacity(BATCH),
             row_nr: Vec::with_capacity(BATCH),
             sequence: Vec::with_capacity(BATCH),
             publisher_id: Vec::with_capacity(BATCH),
@@ -453,6 +459,7 @@ impl OutBuffer {
     }
 
     fn push(&mut self, row: Row, top: &Top, is_trade: bool) {
+        self.ts_event.push(row.ts_event);
         self.row_nr.push(row.row_nr);
         self.sequence.push(row.sequence);
         self.publisher_id.push(row.publisher_id);
@@ -477,6 +484,10 @@ impl OutBuffer {
             return Ok(None);
         }
         let mut cols: Vec<ArrayRef> = vec![
+            Arc::new(
+                TimestampNanosecondArray::from(std::mem::take(&mut self.ts_event))
+                    .with_timezone("UTC"),
+            ),
             Arc::new(UInt64Array::from(std::mem::take(&mut self.row_nr))),
             Arc::new(UInt32Array::from(std::mem::take(&mut self.sequence))),
             Arc::new(UInt16Array::from(std::mem::take(&mut self.publisher_id))),
@@ -511,6 +522,7 @@ impl OutBuffer {
     }
 
     fn reset_caps(&mut self) {
+        self.ts_event = Vec::with_capacity(BATCH);
         self.row_nr = Vec::with_capacity(BATCH);
         self.sequence = Vec::with_capacity(BATCH);
         self.publisher_id = Vec::with_capacity(BATCH);
@@ -539,6 +551,11 @@ fn reserve_cols<T>(cols: &mut [Vec<T>]) {
 
 fn schema(levels: usize) -> Schema {
     let mut fields = vec![
+        Field::new(
+            "ts_event",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            false,
+        ),
         Field::new("row_nr", DataType::UInt64, false),
         Field::new("sequence", DataType::UInt32, false),
         Field::new("publisher_id", DataType::UInt16, false),
@@ -559,6 +576,7 @@ fn schema(levels: usize) -> Schema {
 }
 
 struct InCols<'a> {
+    ts_event: &'a dyn Array,
     sequence: &'a UInt32Array,
     publisher_id: &'a UInt16Array,
     instrument_id: &'a UInt32Array,
@@ -574,6 +592,7 @@ struct InCols<'a> {
 impl<'a> InCols<'a> {
     fn new(batch: &'a RecordBatch) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
+            ts_event: batch.column(batch.schema().index_of("ts_event")?).as_ref(),
             sequence: col(batch, "sequence")?,
             publisher_id: col(batch, "publisher_id")?,
             instrument_id: col(batch, "instrument_id")?,
@@ -623,6 +642,25 @@ fn byte_at(array: &dyn Array, i: usize) -> Result<u8, Box<dyn std::error::Error>
             .ok_or_else(|| "empty action/side".into());
     }
     Err(format!("expected string action/side, got {:?}", array.data_type()).into())
+}
+
+fn timestamp_ns_at(array: &dyn Array, i: usize) -> Result<i64, Box<dyn std::error::Error>> {
+    if array.is_null(i) {
+        return Err("null ts_event".into());
+    }
+    if let Some(a) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        return Ok(a.value(i));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+        return Ok(a.value(i) * 1_000);
+    }
+    if let Some(a) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
+        return Ok(a.value(i) * 1_000_000);
+    }
+    if let Some(a) = array.as_any().downcast_ref::<TimestampSecondArray>() {
+        return Ok(a.value(i) * 1_000_000_000);
+    }
+    Err(format!("expected timestamp ts_event, got {:?}", array.data_type()).into())
 }
 
 fn side_code(side: u8) -> Option<u8> {

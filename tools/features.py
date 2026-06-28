@@ -43,7 +43,16 @@ def add_features(lf: pl.LazyFrame, feature_exprs: Mapping[str, pl.Expr]) -> pl.L
 
 
 def depth_meta(n: int = 1) -> list[str]:
-    cols = ["row_nr", "sequence", "publisher_id", "instrument_id", "trade_px", "trade_sz", "trade_side"]
+    cols = [
+        "ts_event",
+        "row_nr",
+        "sequence",
+        "publisher_id",
+        "instrument_id",
+        "trade_px",
+        "trade_sz",
+        "trade_side",
+    ]
     for i in range(n):
         cols += [f"bid_px_{i}", f"bid_sz_{i}", f"bid_ct_{i}", f"ask_px_{i}", f"ask_sz_{i}", f"ask_ct_{i}"]
     return cols
@@ -111,15 +120,19 @@ class LOBFeatures:
         log: bool = False,
         eps: float = 1e-12,
     ) -> pl.Expr:
+        bid0 = pl.col("bid_px_0").cast(pl.Float64)
+        ask0 = pl.col("ask_px_0").cast(pl.Float64)
         bid = LOBFeatures._avg_price_for_size("bid", depth, total_size)
         ask = LOBFeatures._avg_price_for_size("ask", depth, total_size)
-        return LOBFeatures._diff(ask, bid, log, eps)
+        return 2. * LOBFeatures._diff(ask, bid, log, eps) / (ask0 + bid0) * 1e4
 
     @staticmethod
     def size_weighted_avg_price(depth: int, total_size: float) -> pl.Expr:
+        bid0 = pl.col("bid_px_0").cast(pl.Float64)
+        ask0 = pl.col("ask_px_0").cast(pl.Float64)
         bid = LOBFeatures._avg_price_for_size("bid", depth, total_size)
         ask = LOBFeatures._avg_price_for_size("ask", depth, total_size)
-        return (bid + ask) / 2
+        return ((bid + ask) / (bid0 + ask0)).log() * 1e4
 
     @staticmethod
     def _diff(left: pl.Expr, right: pl.Expr, log: bool, eps: float) -> pl.Expr:

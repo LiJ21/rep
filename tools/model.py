@@ -160,10 +160,16 @@ class LarsAdapter:
     positive: bool = False
     batch_size: int | None = 200_000
     max_features: int | None = None
+    stats_backend: str = "cpu"
+    stats_dtype: Any = np.float64
     streaming: bool = True
     cache_path: bool = True
-    _stats_cache: dict[Any, "_LarsStats"] = field(default_factory=dict, init=False, repr=False)
-    _path_cache: dict[Any, tuple[np.ndarray, list[int], np.ndarray]] = field(default_factory=dict, init=False, repr=False)
+    _stats_cache: dict[Any, "_LinearStats"] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _path_cache: dict[Any, tuple[np.ndarray, list[int], np.ndarray]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def build(self, params: dict[str, Any]) -> "LarsPathModel":
         cfg = {
@@ -176,7 +182,15 @@ class LarsAdapter:
             "positive": self.positive,
             **params,
         }
-        known = {"alpha", "method", "fit_intercept", "max_iter", "alpha_min", "eps", "positive"}
+        known = {
+            "alpha",
+            "method",
+            "fit_intercept",
+            "max_iter",
+            "alpha_min",
+            "eps",
+            "positive",
+        }
         unknown = set(cfg) - known
         if unknown:
             raise ValueError(f"unsupported LarsAdapter params: {sorted(unknown)}")
@@ -252,21 +266,23 @@ class LarsAdapter:
             "coefs_path": model.coefs_path.copy(),
         }
 
-    def _stats(self, src: "DataSource") -> "_LarsStats":
+    def _stats(self, src: "DataSource") -> "_LinearStats":
         key = self._stats_key(src)
         if key is not None and key in self._stats_cache:
             return self._stats_cache[key]
 
-        stats: _LarsStats | None = None
+        stats: _LinearStats | None = None
         for x, y, _ in src.batches(self.batch_size):
-            x = np.asarray(x, dtype=float)
-            y = np.asarray(y, dtype=float).reshape(-1)
+            x = np.asarray(x)
+            y = np.asarray(y).reshape(-1)
             if len(y) == 0:
                 continue
             if stats is None:
                 if self.max_features is not None and x.shape[1] > self.max_features:
-                    raise MemoryError(f"LarsAdapter got {x.shape[1]} features; max_features={self.max_features}")
-                stats = _LarsStats.empty(x.shape[1])
+                    raise MemoryError(
+                        f"LarsAdapter got {x.shape[1]} features; max_features={self.max_features}"
+                    )
+                stats = _LinearStats.empty(x.shape[1], self._stats_xp(), self.stats_dtype)
             stats.add(x, y)
 
         if stats is None or stats.n == 0:
@@ -279,13 +295,41 @@ class LarsAdapter:
         key = getattr(src, "cache_key", None)
         if key is None:
             return None
-        return (key, tuple(src.features), src.target)
+        return (
+            key,
+            tuple(src.features),
+            src.target,
+            self.stats_backend,
+            str(np.dtype(self.stats_dtype)),
+        )
 
     def _path_key(self, src: "DataSource", model: "LarsPathModel") -> Any | None:
         key = self._stats_key(src)
         if not self.cache_path or key is None:
             return None
-        return (key, model.method, model.fit_intercept, model.max_iter, model.alpha_min, model.eps, model.positive)
+        return (
+            key,
+            model.method,
+            model.fit_intercept,
+            model.max_iter,
+            model.alpha_min,
+            model.eps,
+            model.positive,
+        )
+
+    def _stats_xp(self) -> Any:
+        name = self.stats_backend.lower()
+        if name in {"cpu", "numpy"}:
+            return np
+        if name in {"cupy", "gpu"}:
+            try:
+                import cupy as cp
+            except ImportError as exc:
+                raise ImportError(
+                    "LarsAdapter stats_backend='cupy' requires CuPy; for CUDA 12 install cupy-cuda12x, not cupy."
+                ) from exc
+            return cp
+        raise ValueError("stats_backend must be one of: 'cpu', 'numpy', 'cupy', 'gpu'")
 
     @staticmethod
     def _coef_at(alphas: np.ndarray, coefs_path: np.ndarray, alpha: float) -> np.ndarray:
@@ -327,19 +371,160 @@ class LarsPathModel:
 
 
 @dataclass
-class _LarsStats:
-    xtx: np.ndarray
-    xty: np.ndarray
-    x_sum: np.ndarray
+class RidgeAdapter:
+    alpha: float = 1.0
+    fit_intercept: bool = True
+    batch_size: int | None = 200_000
+    max_features: int | None = None
+    stats_backend: str = "cpu"
+    stats_dtype: Any = np.float64
+    streaming: bool = True
+    cache_stats: bool = True
+    _stats_cache: dict[Any, "_LinearStats"] = field(
+        default_factory=dict, init=False, repr=False
+    )
+
+    def build(self, params: dict[str, Any]) -> "RidgeModel":
+        cfg = {"alpha": self.alpha, "fit_intercept": self.fit_intercept, **params}
+        unknown = set(cfg) - {"alpha", "fit_intercept"}
+        if unknown:
+            raise ValueError(f"unsupported RidgeAdapter params: {sorted(unknown)}")
+        return RidgeModel(
+            alpha=float(cfg["alpha"]),
+            fit_intercept=bool(cfg["fit_intercept"]),
+            params=dict(params),
+        )
+
+    def fit(
+        self,
+        model: "RidgeModel",
+        train: "DataSource",
+        val: "DataSource | None",
+        tracker: "Tracker",
+        trial: Any | None = None,
+    ) -> "RidgeModel":
+        stats = self._stats(train)
+        gram, xy, x_mean, y_mean = stats.centered(model.fit_intercept)
+        reg = float(model.alpha) * np.eye(stats.n_features, dtype=gram.dtype)
+        model.coef = _solve_linear(gram + reg, xy)
+        model.intercept = (
+            float(y_mean - x_mean @ model.coef) if model.fit_intercept else 0.0
+        )
+        model.n_samples = stats.n
+        model.x_mean = x_mean
+        model.y_mean = y_mean
+        if tracker is not None:
+            tracker.log(
+                {
+                    "ridge/alpha": model.alpha,
+                    "ridge/n": stats.n,
+                    "ridge/n_features": stats.n_features,
+                }
+            )
+        return model
+
+    def predict(self, model: "RidgeModel", x: np.ndarray) -> np.ndarray:
+        return model.predict(x)
+
+    def _stats(self, src: "DataSource") -> "_LinearStats":
+        key = self._stats_key(src)
+        if key is not None and key in self._stats_cache:
+            return self._stats_cache[key]
+
+        stats: _LinearStats | None = None
+        for x, y, _ in src.batches(self.batch_size):
+            x = np.asarray(x)
+            y = np.asarray(y).reshape(-1)
+            if len(y) == 0:
+                continue
+            if stats is None:
+                if self.max_features is not None and x.shape[1] > self.max_features:
+                    raise MemoryError(
+                        f"RidgeAdapter got {x.shape[1]} features; max_features={self.max_features}"
+                    )
+                stats = _LinearStats.empty(x.shape[1], self._stats_xp(), self.stats_dtype)
+            stats.add(x, y)
+
+        if stats is None or stats.n == 0:
+            raise ValueError("cannot fit RidgeAdapter on empty data")
+        if key is not None:
+            self._stats_cache[key] = stats
+        return stats
+
+    def _stats_key(self, src: "DataSource") -> Any | None:
+        if not self.cache_stats:
+            return None
+        key = getattr(src, "cache_key", None)
+        if key is None:
+            return None
+        return (
+            key,
+            tuple(src.features),
+            src.target,
+            self.stats_backend,
+            str(np.dtype(self.stats_dtype)),
+        )
+
+    def _stats_xp(self) -> Any:
+        name = self.stats_backend.lower()
+        if name in {"cpu", "numpy"}:
+            return np
+        if name in {"cupy", "gpu"}:
+            try:
+                import cupy as cp
+            except ImportError as exc:
+                raise ImportError(
+                    "RidgeAdapter stats_backend='cupy' requires CuPy; for CUDA 12 install cupy-cuda12x, not cupy."
+                ) from exc
+            return cp
+        raise ValueError("stats_backend must be one of: 'cpu', 'numpy', 'cupy', 'gpu'")
+
+
+@dataclass
+class RidgeModel:
+    alpha: float
+    fit_intercept: bool = True
+    params: dict[str, Any] = field(default_factory=dict)
+    coef: np.ndarray | None = None
+    intercept: float = 0.0
+    n_samples: int = 0
+    x_mean: np.ndarray | None = None
+    y_mean: float = 0.0
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        if self.coef is None:
+            raise RuntimeError("RidgeModel is not fitted")
+        return np.asarray(x, dtype=float) @ self.coef + self.intercept
+
+
+def _solve_linear(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    try:
+        return np.linalg.solve(a, b)
+    except np.linalg.LinAlgError:
+        return np.linalg.lstsq(a, b, rcond=None)[0]
+
+
+@dataclass
+class _LinearStats:
+    xp: Any
+    dtype: Any
+    xtx: Any
+    xty: Any
+    x_sum: Any
     y_sum: float = 0.0
     n: int = 0
 
     @classmethod
-    def empty(cls, n_features: int) -> "_LarsStats":
+    def empty(
+        cls, n_features: int, xp: Any = np, dtype: Any = np.float64
+    ) -> "_LinearStats":
+        dtype = xp.dtype(dtype)
         return cls(
-            xtx=np.zeros((n_features, n_features), dtype=float),
-            xty=np.zeros(n_features, dtype=float),
-            x_sum=np.zeros(n_features, dtype=float),
+            xp=xp,
+            dtype=dtype,
+            xtx=xp.zeros((n_features, n_features), dtype=dtype),
+            xty=xp.zeros(n_features, dtype=dtype),
+            x_sum=xp.zeros(n_features, dtype=dtype),
         )
 
     @property
@@ -350,21 +535,30 @@ class _LarsStats:
         if x.shape[0] != len(y):
             raise ValueError(f"batch length mismatch: X={x.shape[0]} y={len(y)}")
         if x.shape[1] != self.n_features:
-            raise ValueError(f"feature count changed: expected {self.n_features}, got {x.shape[1]}")
+            raise ValueError(
+                f"feature count changed: expected {self.n_features}, got {x.shape[1]}"
+            )
+        x = self.xp.asarray(x, dtype=self.dtype)
+        y = self.xp.asarray(y, dtype=self.dtype).reshape(-1)
         self.xtx += x.T @ x
         self.xty += x.T @ y
         self.x_sum += x.sum(axis=0)
-        self.y_sum += float(y.sum())
+        self.y_sum += float(self._cpu(y.sum()).item())
         self.n += len(y)
 
     def centered(self, fit_intercept: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
         if not fit_intercept:
-            return self.xtx.copy(), self.xty.copy(), np.zeros(self.n_features), 0.0
+            return self._cpu(self.xtx), self._cpu(self.xty), np.zeros(self.n_features), 0.0
         x_mean = self.x_sum / self.n
         y_mean = self.y_sum / self.n
-        gram = self.xtx - np.outer(self.x_sum, self.x_sum) / self.n
+        gram = self.xtx - self.xp.outer(self.x_sum, self.x_sum) / self.n
         xy = self.xty - self.x_sum * y_mean
-        return gram, xy, x_mean, float(y_mean)
+        return self._cpu(gram), self._cpu(xy), self._cpu(x_mean), float(y_mean)
+
+    def _cpu(self, x: Any) -> np.ndarray:
+        if self.xp is np:
+            return np.asarray(x).copy()
+        return self.xp.asnumpy(x)
 
 
 @dataclass

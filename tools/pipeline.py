@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 import polars as pl
 
-from tools.data import DataSource, Loader
+from tools.data import POLARS_ENGINES, DataSource, Loader
 from tools.search import (
     BySizeRecency,
     ParamFn,
@@ -58,6 +58,116 @@ def rmse(
     return ScoreValue(float(np.sqrt(sse / n)) if n else 0.0, n, {"sse": sse})
 
 
+def r2(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    ctx: dict[str, Any] | None = None,
+    combine_with: Any = _NO_COMBINE,
+) -> float | ScoreValue:
+    y = np.asarray(y_true, dtype=float)
+    err = y - np.asarray(y_pred, dtype=float)
+    sse = float(np.dot(err, err))
+    y_sum = float(y.sum())
+    y2_sum = float(np.dot(y, y))
+    n = int(len(y))
+    if combine_with is not _NO_COMBINE and combine_with is not None:
+        state = getattr(combine_with, "state", {})
+        sse += float(state.get("sse", 0.0))
+        y_sum += float(state.get("y_sum", 0.0))
+        y2_sum += float(state.get("y2_sum", 0.0))
+        n += int(getattr(combine_with, "n", 0))
+    score = _r2_from_stats(sse, y_sum, y2_sum, n)
+    if combine_with is _NO_COMBINE:
+        return score
+    return ScoreValue(score, n, {"sse": sse, "y_sum": y_sum, "y2_sum": y2_sum})
+
+
+def _r2_from_stats(sse: float, y_sum: float, y2_sum: float, n: int) -> float:
+    if n == 0:
+        return 0.0
+    sst = y2_sum - y_sum * y_sum / n
+    if sst <= 0.0:
+        return 1.0 if sse <= 0.0 else 0.0
+    return float(1.0 - sse / sst)
+
+
+def correlation(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    ctx: dict[str, Any] | None = None,
+    combine_with: Any = _NO_COMBINE,
+) -> float | ScoreValue:
+    y = np.asarray(y_true, dtype=float)
+    p = np.asarray(y_pred, dtype=float)
+    state = {
+        "y_sum": float(y.sum()),
+        "p_sum": float(p.sum()),
+        "y2_sum": float(np.dot(y, y)),
+        "p2_sum": float(np.dot(p, p)),
+        "yp_sum": float(np.dot(y, p)),
+    }
+    n = int(len(y))
+    if combine_with is not _NO_COMBINE and combine_with is not None:
+        old = getattr(combine_with, "state", {})
+        state = {k: v + float(old.get(k, 0.0)) for k, v in state.items()}
+        n += int(getattr(combine_with, "n", 0))
+    score = _corr_from_stats(n, **state)
+    if combine_with is _NO_COMBINE:
+        return score
+    return ScoreValue(score, n, state)
+
+
+def _corr_from_stats(
+    n: int,
+    y_sum: float,
+    p_sum: float,
+    y2_sum: float,
+    p2_sum: float,
+    yp_sum: float,
+) -> float:
+    if n < 2:
+        return 0.0
+    cov = yp_sum - y_sum * p_sum / n
+    y_var = y2_sum - y_sum * y_sum / n
+    p_var = p2_sum - p_sum * p_sum / n
+    denom = y_var * p_var
+    return float(cov / np.sqrt(denom)) if denom > 0.0 else 0.0
+
+
+def unit_pnl(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    ctx: dict[str, Any] | None = None,
+    threshold: float = 0.0,
+    combine_with: Any = _NO_COMBINE,
+) -> float | ScoreValue:
+    y = np.asarray(y_true, dtype=float)
+    p = np.asarray(y_pred, dtype=float)
+    mask = np.abs(p) > threshold
+    pnl = float(np.sum(np.sign(p[mask]) * y[mask]))
+    n = int(len(p))
+    if combine_with is not _NO_COMBINE and combine_with is not None:
+        pnl += float(getattr(combine_with, "state", {}).get("pnl", 0.0))
+        n += int(getattr(combine_with, "n", 0))
+    score = pnl / n if n else 0.0
+    if combine_with is _NO_COMBINE:
+        return score
+    return ScoreValue(score, n, {"pnl": pnl})
+
+
+def get_unit_pnl(threshold: float) -> Score:
+    def score(
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        ctx: dict[str, Any] | None = None,
+        combine_with: Any = _NO_COMBINE,
+    ) -> float | ScoreValue:
+        return unit_pnl(y_true, y_pred, ctx, threshold, combine_with)
+
+    score.__name__ = f"unit_pnl_{threshold:g}"
+    return score
+
+
 @dataclass
 class Pipeline:
     rolling_dates: list[list[str]]
@@ -68,7 +178,7 @@ class Pipeline:
     data_loader: Loader
     search_space: SearchSpace | ParamFn | None = None
     val_score: Score = rmse
-    test_score: Score = rmse
+    score_direction: str = "minimize"
     transform: Transform = field(default_factory=Passthrough)
     train_filters: tuple[pl.Expr, ...] = ()
     val_filters: tuple[pl.Expr, ...] = ()
@@ -80,6 +190,7 @@ class Pipeline:
     tracker: Tracker = field(default_factory=NullTracker)
     cache_arrays: bool = False
     seed: int | None = None
+    polars_engine: str = "streaming"
 
     model: Any = field(default=None, init=False)
     best_params: dict[str, Any] | None = field(default=None, init=False)
@@ -88,10 +199,16 @@ class Pipeline:
     validation_history: list[dict[str, Any]] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
+        self.score_direction = self.score_direction.lower()
+        if self.score_direction not in {"minimize", "maximize"}:
+            raise ValueError("score_direction must be 'minimize' or 'maximize'")
+        self.polars_engine = self.polars_engine.lower()
+        if self.polars_engine not in POLARS_ENGINES:
+            raise ValueError(f"polars_engine must be one of: {sorted(POLARS_ENGINES)}")
         self.train_filters = tuple(self.train_filters)
         self.val_filters = tuple(self.val_filters)
         self.test_filters = tuple(self.test_filters)
-        self._transform_cache: dict[tuple[str, ...], Transform] = {}
+        self._transform_cache: dict[tuple[Any, ...], Transform] = {}
         self._array_cache: dict[
             tuple[Any, ...], tuple[np.ndarray, np.ndarray, dict[str, Any]]
         ] = {}
@@ -105,11 +222,21 @@ class Pipeline:
         folds = expanding_folds(self.rolling_dates)
         self.validation_history.clear()
         self.tracker.start_run(
-            {"sampler": self.sampler, "n_trials": self.n_trials, "n_folds": len(folds)}
+            {
+                "sampler": self.sampler,
+                "n_trials": self.n_trials,
+                "n_folds": len(folds),
+                "score_direction": self.score_direction,
+                "polars_engine": self.polars_engine,
+            }
         )
         try:
             self.study = create_study(
-                self.sampler, self.search_space, pruner=self.pruner, seed=self.seed
+                self.sampler,
+                self.search_space,
+                direction=self.score_direction,
+                pruner=self.pruner,
+                seed=self.seed,
             )
             import optuna
 
@@ -211,7 +338,7 @@ class Pipeline:
         finally:
             self.tracker.finish()
 
-    def test(self) -> dict[str, Any]:
+    def test(self, score: Score = rmse) -> dict[str, Any]:
         if self.model is None:
             raise RuntimeError("call train() before test()")
         transform = self.fitted_transform or self._fit_transform(
@@ -219,7 +346,7 @@ class Pipeline:
         )
         src = self._src(self.test_dates, self.test_filters, transform, "test")
         loss, ctx, y_pred = self._evaluate(
-            self.model, src, self.test_score, "test", keep_predictions=True
+            self.model, src, score, "test", keep_predictions=True
         )
         return {"test_score": loss, "n": int(ctx["n"]), "ctx": ctx, "y_pred": y_pred}
 
@@ -251,7 +378,7 @@ class Pipeline:
             return self._fit_model(model, train_src, None, None)
 
     def _fit_transform(self, dates: Sequence[str]) -> Transform:
-        key = tuple(dates)
+        key = (tuple(dates), self.polars_engine)
         if key not in self._transform_cache:
             src = self._src(dates, self.train_filters, None, "fit")
             transform = copy.deepcopy(self.transform)
@@ -265,7 +392,7 @@ class Pipeline:
         transform: Transform | None,
         role: str,
     ) -> DataSource:
-        key = (role, tuple(dates), id(transform))
+        key = (role, tuple(dates), id(transform), self.polars_engine)
         return DataSource(
             dates=list(dates),
             loader=self.data_loader,
@@ -275,6 +402,7 @@ class Pipeline:
             transform=transform,
             cache=self._array_cache if self.cache_arrays else None,
             cache_key=key,
+            polars_engine=self.polars_engine,
         )
 
     def _fit_model(

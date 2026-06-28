@@ -35,9 +35,10 @@ class DateFrame:
 
 Loader = Callable[[list[str]], list[DateFrame]]
 Batch = tuple[np.ndarray, np.ndarray, dict[str, Any]]
+POLARS_ENGINES = {"auto", "streaming", "gpu"}
 
 
-def expand_dates(dates: str, exclude_holiday: str | None = "cme", str_result: bool = True):
+def expand_dates(dates: str, exclude_holiday: str | None = "cme", str_result: bool = True, end_date: bool = True):
     parts = dates.split("-")
     start = datetime.strptime(parts[0], "%Y%m%d").date()
     end = datetime.strptime(parts[-1], "%Y%m%d").date()
@@ -54,6 +55,8 @@ def expand_dates(dates: str, exclude_holiday: str | None = "cme", str_result: bo
         sessions = set(ec.get_calendar(cal).sessions_in_range(start, end).date)
         days = [d for d in days if d in sessions]
 
+    end = len(days) if end_date else -1
+    days = days[:end]
     return [d.isoformat() for d in days] if str_result else days
 
 
@@ -99,6 +102,13 @@ def _to_batch(df: pl.DataFrame, features: Sequence[str], target: str) -> Batch:
     return x, y, _ctx_from_df(df)
 
 
+def _check_polars_engine(engine: str) -> str:
+    engine = engine.lower()
+    if engine not in POLARS_ENGINES:
+        raise ValueError(f"polars_engine must be one of: {sorted(POLARS_ENGINES)}")
+    return engine
+
+
 @dataclass
 class DataSource:
     dates: list[str]
@@ -109,7 +119,11 @@ class DataSource:
     transform: Any = None
     cache: dict[tuple[Any, ...], Batch] | None = None
     cache_key: tuple[Any, ...] | None = None
+    polars_engine: str = "streaming"
     _frames: list[DateFrame] | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.polars_engine = _check_polars_engine(self.polars_engine)
 
     def date_frames(self) -> list[DateFrame]:
         if self._frames is None:
@@ -125,7 +139,11 @@ class DataSource:
     def materialize(self) -> Batch:
         if self.cache is not None and self.cache_key is not None and self.cache_key in self.cache:
             return self.cache[self.cache_key]
-        batch = _to_batch(self.frame().collect(engine="streaming"), self.features, self.target)
+        batch = _to_batch(
+            self.frame().collect(engine=self.polars_engine),
+            self.features,
+            self.target,
+        )
         if self.cache is not None and self.cache_key is not None:
             self.cache[self.cache_key] = batch
         return batch
@@ -134,21 +152,31 @@ class DataSource:
         for item in self.date_frames():
             lf = self._prepare(item)
             if batch_size is None:
-                yield _to_batch(lf.collect(engine="streaming"), self.features, self.target)
+                yield _to_batch(
+                    lf.collect(engine=self.polars_engine),
+                    self.features,
+                    self.target,
+                )
                 continue
-            for df in lf.collect_batches(chunk_size=batch_size, maintain_order=True):
+            for df in lf.collect_batches(
+                chunk_size=batch_size,
+                maintain_order=True,
+                engine=self.polars_engine,
+            ):
                 yield _to_batch(df, self.features, self.target)
 
     def labels(self) -> tuple[np.ndarray, dict[str, Any]]:
         parts = []
         cols = [self.target, *CTX_COLS]
         for item in self.date_frames():
-            parts.append(self._prepare(item, cols=cols).collect(engine="streaming"))
+            parts.append(
+                self._prepare(item, cols=cols).collect(engine=self.polars_engine)
+            )
         df = pl.concat(parts, how="vertical") if parts else pl.DataFrame(schema=cols)
         return df.get_column(self.target).to_numpy(), _ctx_from_df(df)
 
     def count(self) -> int:
-        return int(self.frame().select(pl.len()).collect(engine="streaming").item())
+        return int(self.frame().select(pl.len()).collect(engine=self.polars_engine).item())
 
     def with_transform(self, transform: Any) -> "DataSource":
         from tools.transform import compose_transform
@@ -167,6 +195,7 @@ class DataSource:
             transform=compose_transform(self.transform, transform),
             cache=self.cache,
             cache_key=cache_key,
+            polars_engine=self.polars_engine,
         )
         out._frames = self._frames
         return out

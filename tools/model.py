@@ -25,6 +25,7 @@ class ModelAdapter(Protocol):
         val: "DataSource | None",
         tracker: "Tracker",
         trial: Any | None = None,
+        fit_context: dict[str, Any] | None = None,
     ) -> Any: ...
 
     def predict(self, model: Any, x: np.ndarray) -> np.ndarray: ...
@@ -45,6 +46,7 @@ class DummyAdapter:
         val: "DataSource | None",
         tracker: "Tracker",
         trial: Any | None = None,
+        fit_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         x, y, _ = train.materialize()
         if self.mode == "linear" and x.size:
@@ -80,6 +82,7 @@ class XGBoostAdapter:
         val: "DataSource | None",
         tracker: "Tracker",
         trial: Any | None = None,
+        fit_context: dict[str, Any] | None = None,
     ) -> Any:
         try:
             import xgboost as xgb
@@ -110,7 +113,7 @@ class XGBoostAdapter:
             num_boost_round=self.num_boost_round,
             evals=evals,
             evals_result=history,
-            early_stopping_rounds=self.early_stopping_rounds,
+            early_stopping_rounds=self.early_stopping_rounds if evals else None,
             callbacks=callbacks,
             verbose_eval=False,
         )
@@ -118,6 +121,8 @@ class XGBoostAdapter:
             for metric, values in metrics.items():
                 if values:
                     tracker.log({f"xgb/{name}_{metric}": values[-1]})
+        if trial is not None:
+            self._record_trial_fit(trial, booster, fit_context)
         return booster
 
     def predict(self, model: Any, x: np.ndarray) -> np.ndarray:
@@ -147,6 +152,84 @@ class XGBoostAdapter:
                 return 1
 
         return xgb.QuantileDMatrix(BatchIter(), ref=ref)
+
+    def _record_trial_fit(
+        self,
+        trial: Any,
+        booster: Any,
+        fit_context: dict[str, Any] | None,
+    ) -> None:
+        record = self._fit_record(booster, fit_context)
+        records = list(trial.user_attrs.get("xgb_fits", []))
+        records.append(record)
+        trial.set_user_attr("xgb_fits", records)
+
+        cv_rounds = [
+            int(item["best_num_boost_round"])
+            for item in records
+            if item.get("role") == "cv" and item.get("best_num_boost_round") is not None
+        ]
+        if cv_rounds:
+            trial.set_user_attr("xgb_cv_best_num_boost_rounds", cv_rounds)
+            trial.set_user_attr(
+                "xgb_cv_best_num_boost_round_median",
+                float(np.median(cv_rounds)),
+            )
+            trial.set_user_attr("xgb_cv_best_num_boost_round_max", max(cv_rounds))
+
+    def _fit_record(
+        self,
+        booster: Any,
+        fit_context: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        ctx = fit_context or {}
+        best_iteration = _as_optional_int(_safe_attr(booster, "best_iteration"))
+        best_score = _as_optional_float(_safe_attr(booster, "best_score"))
+        record: dict[str, Any] = {
+            "role": ctx.get("role"),
+            "fold": ctx.get("fold"),
+            "train_dates": ctx.get("train_dates"),
+            "val_dates": ctx.get("val_dates"),
+            "best_iteration": best_iteration,
+            "best_num_boost_round": (
+                best_iteration + 1 if best_iteration is not None else None
+            ),
+            "best_score": best_score,
+            "num_boosted_rounds": _num_boosted_rounds(booster),
+        }
+        return record
+
+
+def _safe_attr(obj: Any, name: str) -> Any | None:
+    try:
+        return getattr(obj, name)
+    except (AttributeError, ValueError):
+        return None
+
+
+def _as_optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _num_boosted_rounds(booster: Any) -> int | None:
+    try:
+        return int(booster.num_boosted_rounds())
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 @dataclass
@@ -212,6 +295,7 @@ class LarsAdapter:
         val: "DataSource | None",
         tracker: "Tracker",
         trial: Any | None = None,
+        fit_context: dict[str, Any] | None = None,
     ) -> "LarsPathModel":
         try:
             from sklearn.linear_model import lars_path_gram
@@ -402,6 +486,7 @@ class RidgeAdapter:
         val: "DataSource | None",
         tracker: "Tracker",
         trial: Any | None = None,
+        fit_context: dict[str, Any] | None = None,
     ) -> "RidgeModel":
         stats = self._stats(train)
         gram, xy, x_mean, y_mean = stats.centered(model.fit_intercept)
@@ -584,6 +669,7 @@ class TorchAdapter:
         val: "DataSource | None",
         tracker: "Tracker",
         trial: Any | None = None,
+        fit_context: dict[str, Any] | None = None,
     ) -> Any:
         import torch
 

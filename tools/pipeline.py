@@ -145,11 +145,13 @@ def unit_pnl(
     p = np.asarray(y_pred, dtype=float)
     mask = np.abs(p) > threshold
     pnl = float(np.sum(np.sign(p[mask]) * y[mask]))
-    n = int(len(p))
+    n = int(len(p[mask]))
     if combine_with is not _NO_COMBINE and combine_with is not None:
         pnl += float(getattr(combine_with, "state", {}).get("pnl", 0.0))
         n += int(getattr(combine_with, "n", 0))
     score = pnl / n if n else 0.0
+    if ctx is not None:
+        ctx["n_active"] = n
     if combine_with is _NO_COMBINE:
         return score
     return ScoreValue(score, n, {"pnl": pnl})
@@ -274,7 +276,18 @@ class Pipeline:
                         enabled=memory_log,
                         interval=memory_interval,
                     ):
-                        model = self._fit_model(model, train_src, val_src, trial)
+                        model = self._fit_model(
+                            model,
+                            train_src,
+                            val_src,
+                            trial,
+                            fit_context={
+                                "role": "cv",
+                                "fold": fold,
+                                "train_dates": list(train_dates),
+                                "val_dates": list(val_dates),
+                            },
+                        )
                     with self._memory_log(
                         f"trial={trial.number} fold={fold} _evaluate val_dates={val_dates}",
                         enabled=memory_log,
@@ -375,7 +388,18 @@ class Pipeline:
             enabled=memory_log,
             interval=memory_interval,
         ):
-            return self._fit_model(model, train_src, None, None)
+            return self._fit_model(
+                model,
+                train_src,
+                None,
+                None,
+                fit_context={
+                    "role": "refit",
+                    "fold": None,
+                    "train_dates": list(train_dates),
+                    "val_dates": None,
+                },
+            )
 
     def _fit_transform(self, dates: Sequence[str]) -> Transform:
         key = (tuple(dates), self.polars_engine)
@@ -406,15 +430,24 @@ class Pipeline:
         )
 
     def _fit_model(
-        self, model: Any, train: DataSource, val: DataSource | None, trial: Any | None
+        self,
+        model: Any,
+        train: DataSource,
+        val: DataSource | None,
+        trial: Any | None,
+        fit_context: dict[str, Any] | None = None,
     ) -> Any:
         sig = inspect.signature(self.adapter.fit)
-        accepts_trial = "trial" in sig.parameters or any(
+        accepts_kwargs = any(
             p.kind == p.VAR_KEYWORD for p in sig.parameters.values()
         )
+        kwargs: dict[str, Any] = {}
+        accepts_trial = "trial" in sig.parameters or accepts_kwargs
         if accepts_trial:
-            return self.adapter.fit(model, train, val, self.tracker, trial=trial)
-        return self.adapter.fit(model, train, val, self.tracker)
+            kwargs["trial"] = trial
+        if "fit_context" in sig.parameters or accepts_kwargs:
+            kwargs["fit_context"] = fit_context
+        return self.adapter.fit(model, train, val, self.tracker, **kwargs)
 
     def _evaluate(
         self,
@@ -522,6 +555,9 @@ class Pipeline:
                 total[key] = _ordered_unique(
                     [*total.get(key, []), *[str(v) for v in values]]
                 )
+        for key, value in batch.items():
+            if key not in {"n", "date", "dates", "nature", "natures"}:
+                total[key] = value
 
     def _all_train_dates(self) -> list[str]:
         return [date for chunk in self.rolling_dates for date in chunk]

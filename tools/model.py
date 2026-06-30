@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Protocol, TYPE_CHECKING, runtime_checkable
 
 import numpy as np
@@ -30,9 +32,32 @@ class ModelAdapter(Protocol):
 
     def predict(self, model: Any, x: np.ndarray) -> np.ndarray: ...
 
+    def evaluate(
+        self,
+        model: Any,
+        src: "DataSource",
+        score: Callable[..., float],
+        fold: Any = None,
+        keep_predictions: bool = False,
+    ) -> tuple[float, dict[str, Any], np.ndarray | None]: ...
+
+
+class BaseAdapter:
+    def evaluate(
+        self,
+        model: Any,
+        src: "DataSource",
+        score: Callable[..., float],
+        fold: Any = None,
+        keep_predictions: bool = False,
+    ) -> tuple[float, dict[str, Any], np.ndarray | None]:
+        from tools.pipeline import evaluate_model
+
+        return evaluate_model(self, model, src, score, fold, keep_predictions)
+
 
 @dataclass
-class DummyAdapter:
+class DummyAdapter(BaseAdapter):
     mode: str = "mean"
     streaming: bool = False
 
@@ -64,11 +89,16 @@ class DummyAdapter:
 
 
 @dataclass
-class XGBoostAdapter:
+class XGBoostAdapter(BaseAdapter):
     num_boost_round: int = 100
     early_stopping_rounds: int | None = None
     batch_size: int | None = 200_000
     streaming: bool = True
+    external_memory: bool = False
+    cache_dir: str | Path = "/tmp/xgb_extmem"
+    cache_prefix: str = "xgb"
+    release_data: bool = True
+    xgb_dtype: Any | None = np.float32
     callbacks: list[Any] = field(default_factory=list)
     pruning_metric: str | None = None
 
@@ -89,34 +119,52 @@ class XGBoostAdapter:
         except ImportError as exc:
             raise ImportError("XGBoostAdapter requires xgboost.") from exc
 
-        dtrain = self._dmatrix(xgb, train)
-        evals = []
-        if val is not None:
-            evals.append((self._dmatrix(xgb, val, ref=dtrain), "val"))
-        callbacks = list(self.callbacks)
-        if trial is not None and self.pruning_metric:
-            try:
-                from optuna.integration import XGBoostPruningCallback
-
-                callbacks.append(XGBoostPruningCallback(trial, self.pruning_metric))
-            except ImportError:
-                warnings.warn(
-                    "XGBoost pruning requested, but optuna-integration is not installed; "
-                    "continuing without pruning callback.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
         history: dict[str, Any] = {}
-        booster = xgb.train(
-            model,
-            dtrain,
-            num_boost_round=self.num_boost_round,
-            evals=evals,
-            evals_result=history,
-            early_stopping_rounds=self.early_stopping_rounds if evals else None,
-            callbacks=callbacks,
-            verbose_eval=False,
-        )
+        with self._cache_scope() as cache:
+            dtrain: Any | None = None
+            evals: list[tuple[Any, str]] = []
+            try:
+                dtrain = self._dmatrix(xgb, train, cache_prefix=cache.prefix("train"))
+                if val is not None:
+                    evals.append(
+                        (
+                            self._dmatrix(
+                                xgb,
+                                val,
+                                ref=dtrain,
+                                cache_prefix=cache.prefix("val"),
+                            ),
+                            "val",
+                        )
+                    )
+                callbacks = list(self.callbacks)
+                if trial is not None and self.pruning_metric:
+                    try:
+                        from optuna.integration import XGBoostPruningCallback
+
+                        callbacks.append(
+                            XGBoostPruningCallback(trial, self.pruning_metric)
+                        )
+                    except ImportError:
+                        warnings.warn(
+                            "XGBoost pruning requested, but optuna-integration is "
+                            "not installed; continuing without pruning callback.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                booster = xgb.train(
+                    model,
+                    dtrain,
+                    num_boost_round=self.num_boost_round,
+                    evals=evals,
+                    evals_result=history,
+                    early_stopping_rounds=self.early_stopping_rounds if evals else None,
+                    callbacks=callbacks,
+                    verbose_eval=False,
+                )
+            finally:
+                evals.clear()
+                dtrain = None
         for name, metrics in history.items():
             for metric, values in metrics.items():
                 if values:
@@ -128,16 +176,43 @@ class XGBoostAdapter:
     def predict(self, model: Any, x: np.ndarray) -> np.ndarray:
         return np.asarray(model.inplace_predict(x))
 
-    def _dmatrix(self, xgb: Any, src: "DataSource", ref: Any | None = None) -> Any:
+    def _dmatrix(
+        self,
+        xgb: Any,
+        src: "DataSource",
+        ref: Any | None = None,
+        cache_prefix: str | None = None,
+    ) -> Any:
         if not self.streaming:
+            if self.external_memory:
+                raise ValueError(
+                    "XGBoostAdapter external_memory=True requires streaming=True"
+                )
             x, y, _ = src.materialize()
+            if self.xgb_dtype is not None:
+                x = np.asarray(x, dtype=self.xgb_dtype)
             return xgb.DMatrix(x, label=y)
 
         batch_size = self.batch_size
+        external_memory = self.external_memory
+        if external_memory and not hasattr(xgb, "ExtMemQuantileDMatrix"):
+            raise ImportError(
+                "XGBoostAdapter external_memory=True requires "
+                "xgboost.ExtMemQuantileDMatrix."
+            )
+        if external_memory and cache_prefix is None:
+            raise ValueError("external-memory XGBoost needs a cache_prefix")
+        xgb_dtype = self.xgb_dtype
+        release_data = self.release_data
 
         class BatchIter(xgb.DataIter):
             def __init__(self):
-                super().__init__()
+                kwargs = (
+                    {"cache_prefix": cache_prefix, "release_data": release_data}
+                    if external_memory
+                    else {}
+                )
+                super().__init__(**kwargs)
                 self._iter = None
 
             def reset(self):
@@ -148,10 +223,23 @@ class XGBoostAdapter:
                     x, y, _ = next(self._iter)
                 except StopIteration:
                     return 0
+                if xgb_dtype is not None:
+                    x = np.asarray(x, dtype=xgb_dtype)
                 input_data(data=x, label=y)
                 return 1
 
+        if external_memory:
+            return xgb.ExtMemQuantileDMatrix(BatchIter(), ref=ref)
         return xgb.QuantileDMatrix(BatchIter(), ref=ref)
+
+    def _cache_scope(self) -> "_XGBoostCacheScope":
+        if not self.external_memory:
+            return _XGBoostCacheScope(None)
+        cache_dir = Path(self.cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return _XGBoostCacheScope(
+            TemporaryDirectory(prefix=f"{self.cache_prefix}-", dir=cache_dir)
+        )
 
     def _record_trial_fit(
         self,
@@ -232,8 +320,26 @@ def _num_boosted_rounds(booster: Any) -> int | None:
         return None
 
 
+class _XGBoostCacheScope:
+    def __init__(self, tempdir: TemporaryDirectory[str] | None):
+        self._tempdir = tempdir
+        self._path = Path(tempdir.name) if tempdir is not None else None
+
+    def __enter__(self) -> "_XGBoostCacheScope":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._tempdir is not None:
+            self._tempdir.cleanup()
+
+    def prefix(self, name: str) -> str | None:
+        if self._path is None:
+            return None
+        return str(self._path / name)
+
+
 @dataclass
-class LarsAdapter:
+class LarsAdapter(BaseAdapter):
     alpha: float = 1.0
     method: str = "lasso"
     fit_intercept: bool = True
@@ -247,10 +353,15 @@ class LarsAdapter:
     stats_dtype: Any = np.float64
     streaming: bool = True
     cache_path: bool = True
+    vectorized_path_eval: bool = True
+    path_eval_alphas: Sequence[float] | None = None
     _stats_cache: dict[Any, "_LinearStats"] = field(
         default_factory=dict, init=False, repr=False
     )
     _path_cache: dict[Any, tuple[np.ndarray, list[int], np.ndarray]] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _score_cache: dict[Any, dict[float, tuple[float, dict[str, Any]]]] = field(
         default_factory=dict, init=False, repr=False
     )
 
@@ -322,6 +433,7 @@ class LarsAdapter:
             if key is not None:
                 self._path_cache[key] = cached
         model.alphas, model.active, model.coefs_path = cached
+        model.path_key = key
         model.n_samples = stats.n
         model.x_mean = x_mean
         model.y_mean = y_mean
@@ -340,6 +452,37 @@ class LarsAdapter:
 
     def predict(self, model: "LarsPathModel", x: np.ndarray) -> np.ndarray:
         return model.predict(x)
+
+    def evaluate(
+        self,
+        model: "LarsPathModel",
+        src: "DataSource",
+        score: Callable[..., float],
+        fold: Any = None,
+        keep_predictions: bool = False,
+    ) -> tuple[float, dict[str, Any], np.ndarray | None]:
+        alphas = self._eval_alphas()
+        if (
+            keep_predictions
+            or not self.vectorized_path_eval
+            or not alphas
+            or model.alphas is None
+            or model.coefs_path is None
+            or float(model.alpha) not in set(alphas)
+        ):
+            return super().evaluate(model, src, score, fold, keep_predictions)
+
+        key = self._score_key(model, src, score, alphas)
+        cached = self._score_cache.get(key) if key is not None else None
+        if cached is None:
+            cached = self._score_path(model, src, score, alphas)
+            if key is not None:
+                self._score_cache[key] = cached
+
+        loss, ctx = cached[float(model.alpha)]
+        ctx = dict(ctx)
+        ctx["fold"] = fold
+        return loss, ctx, None
 
     def path(self, model: "LarsPathModel") -> dict[str, Any]:
         if model.alphas is None or model.coefs_path is None:
@@ -401,6 +544,79 @@ class LarsAdapter:
             model.positive,
         )
 
+    def _eval_alphas(self) -> tuple[float, ...]:
+        if self.path_eval_alphas is None:
+            return ()
+        return tuple(dict.fromkeys(float(alpha) for alpha in self.path_eval_alphas))
+
+    def _score_key(
+        self,
+        model: "LarsPathModel",
+        src: "DataSource",
+        score: Callable[..., float],
+        alphas: tuple[float, ...],
+    ) -> Any | None:
+        src_key = getattr(src, "cache_key", None)
+        if src_key is None:
+            return None
+        path_key = model.path_key
+        if path_key is None:
+            path_key = id(model.coefs_path)
+        return (
+            path_key,
+            src_key,
+            tuple(src.features),
+            src.target,
+            id(score),
+            getattr(score, "__name__", None),
+            alphas,
+        )
+
+    def _score_path(
+        self,
+        model: "LarsPathModel",
+        src: "DataSource",
+        score: Callable[..., float],
+        alphas: tuple[float, ...],
+    ) -> dict[float, tuple[float, dict[str, Any]]]:
+        from tools.pipeline import call_score, merge_ctx
+
+        coefs = np.column_stack(
+            [self._coef_at(model.alphas, model.coefs_path, alpha) for alpha in alphas]
+        )
+        intercepts = (
+            float(model.y_mean) - np.asarray(model.x_mean, dtype=float) @ coefs
+            if model.fit_intercept
+            else np.zeros(len(alphas), dtype=float)
+        )
+        states: list[Any] = [None] * len(alphas)
+        ctx: dict[str, Any] = {"n": 0}
+
+        for x, y_true, batch_ctx in src.batches(self.batch_size):
+            x = np.asarray(x, dtype=float)
+            y_true = np.asarray(y_true)
+            preds = x @ coefs + intercepts
+            if len(y_true) != preds.shape[0]:
+                raise ValueError(
+                    f"score length mismatch: y_true={len(y_true)}, y_pred={preds.shape[0]}"
+                )
+            for i in range(len(alphas)):
+                states[i] = call_score(
+                    score,
+                    y_true,
+                    preds[:, i],
+                    dict(batch_ctx),
+                    combine_with=states[i],
+                )
+            merge_ctx(ctx, batch_ctx)
+
+        if any(state is None for state in states):
+            raise ValueError("cannot score empty prediction stream")
+        return {
+            alpha: (float(state), dict(ctx))
+            for alpha, state in zip(alphas, states)
+        }
+
     def _stats_xp(self) -> Any:
         name = self.stats_backend.lower()
         if name in {"cpu", "numpy"}:
@@ -444,6 +660,7 @@ class LarsPathModel:
     alphas: np.ndarray | None = None
     active: list[int] = field(default_factory=list)
     coefs_path: np.ndarray | None = None
+    path_key: Any | None = None
     n_samples: int = 0
     x_mean: np.ndarray | None = None
     y_mean: float = 0.0
@@ -455,7 +672,7 @@ class LarsPathModel:
 
 
 @dataclass
-class RidgeAdapter:
+class RidgeAdapter(BaseAdapter):
     alpha: float = 1.0
     fit_intercept: bool = True
     batch_size: int | None = 200_000
@@ -647,7 +864,7 @@ class _LinearStats:
 
 
 @dataclass
-class TorchAdapter:
+class TorchAdapter(BaseAdapter):
     module_builder: Callable[[dict[str, Any]], Any]
     loss_fn: Any | None = None
     optimizer_builder: Callable[[Any, dict[str, Any]], Any] | None = None

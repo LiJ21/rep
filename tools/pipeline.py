@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import copy
+import datetime as dt
 import gc
+import hashlib
+import io
 import inspect
+import json
 import resource
 import threading
 import time
 from contextlib import contextmanager
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -25,7 +30,7 @@ from tools.search import (
     weighted_mean,
 )
 from tools.track import NullTracker, Tracker
-from tools.transform import Passthrough, Transform
+from tools.transform import Passthrough, Transform, load_transform, save_transform
 from tools.score import Score, rmse, _NO_COMBINE
 
 
@@ -335,6 +340,102 @@ class Pipeline:
     def get_model(self) -> Any:
         return self.model
 
+    def save_model(self, path: str | Path) -> dict[str, Any]:
+        if self.model is None:
+            raise RuntimeError("call train() before save_model()")
+        return self.adapter.save_model(self.model, path)
+
+    def load_model(
+        self,
+        path: str | Path,
+        meta: dict[str, Any] | None = None,
+    ) -> Any:
+        self.model = self.adapter.load_model(path, meta)
+        return self.model
+
+    def save_history(self, path: str | Path) -> dict[str, Any]:
+        payload = self._history_payload()
+        _write_json(Path(path), payload)
+        return payload
+
+    def save_pipeline(self, path: str | Path) -> dict[str, Any]:
+        if self.model is None:
+            raise RuntimeError("call train() before save_pipeline()")
+        root = Path(path)
+        registry_dir = root / "registries"
+        root.mkdir(parents=True, exist_ok=True)
+        registry_dir.mkdir(exist_ok=True)
+
+        model_meta = self.save_model(root / "model")
+        model_meta["path"] = "model"
+        transform_meta = save_transform(
+            self.fitted_transform or self.transform,
+            root / "transform.pkl",
+            registry_dir / "transforms.json",
+        )
+        self.save_history(root / "history.json")
+        filters = {
+            "train": _exprs_to_config(
+                self.train_filters, registry_dir / "filters.json", "train_filter"
+            ),
+            "val": _exprs_to_config(
+                self.val_filters, registry_dir / "filters.json", "val_filter"
+            ),
+            "test": _exprs_to_config(
+                self.test_filters, registry_dir / "filters.json", "test_filter"
+            ),
+        }
+        manifest = {
+            "version": 1,
+            "created_at": dt.datetime.now(dt.UTC).isoformat(),
+            "target": self.target,
+            "features": list(self.features),
+            "rolling_dates": self.rolling_dates,
+            "test_dates": self.test_dates,
+            "best_params": self.best_params,
+            "score_direction": self.score_direction,
+            "val_score": _callable_name(self.val_score),
+            "sampler": self.sampler,
+            "n_trials": self.n_trials,
+            "polars_engine": self.polars_engine,
+            "adapter": _object_info(self.adapter),
+            "data_loader": _object_info(self.data_loader),
+            "model": model_meta,
+            "transform": transform_meta,
+            "filters": filters,
+            "history": {"path": "history.json"},
+        }
+        _write_json(root / "pipeline.json", manifest)
+        return manifest
+
+    def load_pipeline(self, path: str | Path) -> dict[str, Any]:
+        root = Path(path)
+        manifest = _read_json(root / "pipeline.json")
+        self.target = manifest.get("target", self.target)
+        self.features = list(manifest.get("features", self.features))
+        self.rolling_dates = [
+            list(x) for x in manifest.get("rolling_dates", self.rolling_dates)
+        ]
+        self.test_dates = list(manifest.get("test_dates", self.test_dates))
+        self.best_params = manifest.get("best_params")
+        self.score_direction = manifest.get("score_direction", self.score_direction)
+        self.polars_engine = manifest.get("polars_engine", self.polars_engine)
+        self.validation_history = list(
+            _read_json(root / "history.json").get("validation_history", [])
+        )
+
+        transform_meta = manifest.get("transform")
+        if transform_meta:
+            self.fitted_transform = load_transform(root / transform_meta["path"], transform_meta)
+        model_meta = manifest.get("model")
+        if model_meta:
+            self.load_model(root / model_meta["path"], model_meta)
+        filters = manifest.get("filters", {})
+        self.train_filters = tuple(_exprs_from_config(filters.get("train", [])))
+        self.val_filters = tuple(_exprs_from_config(filters.get("val", [])))
+        self.test_filters = tuple(_exprs_from_config(filters.get("test", [])))
+        return manifest
+
     def _refit(
         self,
         params: dict[str, Any],
@@ -434,6 +535,24 @@ class Pipeline:
     def _all_train_dates(self) -> list[str]:
         return [date for chunk in self.rolling_dates for date in chunk]
 
+    def _history_payload(self) -> dict[str, Any]:
+        best_score = None
+        n_trials = 0
+        if self.study is not None:
+            n_trials = len(getattr(self.study, "trials", []))
+            try:
+                best_score = float(self.study.best_value)
+            except (ValueError, AttributeError):
+                pass
+        return {
+            "best_params": self.best_params,
+            "best_score": best_score,
+            "score_direction": self.score_direction,
+            "val_score": _callable_name(self.val_score),
+            "n_trials": n_trials,
+            "validation_history": self.validation_history,
+        }
+
     @contextmanager
     def _memory_log(
         self,
@@ -489,3 +608,100 @@ def _ordered_unique(values: Sequence[str]) -> list[str]:
 
 def _gb(n_bytes: int) -> float:
     return n_bytes / 1024**3
+
+
+def _exprs_to_config(
+    exprs: Sequence[pl.Expr],
+    registry_path: Path,
+    prefix: str,
+) -> list[dict[str, Any]]:
+    return [
+        _expr_to_config(expr, registry_path, f"{prefix}_{i}")
+        for i, expr in enumerate(exprs)
+    ]
+
+
+def _expr_to_config(expr: pl.Expr, registry_path: Path, base_name: str) -> dict[str, Any]:
+    blob = expr.meta.serialize(format="json")
+    fingerprint = hashlib.sha256(blob.encode()).hexdigest()
+    return {
+        "name": _register_name(registry_path, base_name, fingerprint),
+        "base_name": base_name,
+        "kind": "polars_expr",
+        "format": "json",
+        "polars_version": pl.__version__,
+        "expr": blob,
+        "repr": str(expr),
+        "roots": expr.meta.root_names(),
+        "fingerprint": fingerprint,
+    }
+
+
+def _exprs_from_config(configs: Sequence[dict[str, Any]]) -> list[pl.Expr]:
+    return [
+        pl.Expr.deserialize(io.StringIO(cfg["expr"]), format=cfg.get("format", "json"))
+        for cfg in configs
+    ]
+
+
+def _register_name(path: Path, base: str, fingerprint: str) -> str:
+    registry = _read_json(path, {}) if path.exists() else {}
+    if registry.get(base) == fingerprint:
+        return base
+    if base not in registry:
+        registry[base] = fingerprint
+        _write_json(path, registry)
+        return base
+    n = 2
+    while True:
+        name = f"{base}_v{n}"
+        if registry.get(name) == fingerprint:
+            return name
+        if name not in registry:
+            registry[name] = fingerprint
+            _write_json(path, registry)
+            return name
+        n += 1
+
+
+def _read_json(path: Path, default: Any | None = None) -> Any:
+    if default is not None and not path.exists():
+        return default
+    with path.open() as f:
+        return json.load(f)
+
+
+def _write_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w") as f:
+        json.dump(_json_ready(obj), f, indent=2, sort_keys=True)
+        f.write("\n")
+    tmp.replace(path)
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return repr(value)
+
+
+def _callable_name(fn: Any) -> str:
+    return getattr(fn, "__name__", type(fn).__name__)
+
+
+def _object_info(obj: Any) -> dict[str, Any]:
+    cls = type(obj)
+    return {"class": cls.__name__, "module": cls.__module__, "repr": repr(obj)}

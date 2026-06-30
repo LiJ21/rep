@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import inspect
+import json
+import pickle
+import re
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
@@ -153,3 +159,162 @@ class Chain:
         for step in self.steps:
             lf = step.transform(lf)
         return lf
+
+
+def save_transform(
+    transform: Transform,
+    path: str | Path,
+    registry_path: str | Path | None = None,
+    name: str | None = None,
+) -> dict[str, Any]:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as f:
+        _pickle_dump(transform, f)
+    artifact_hash = _sha256_file(path)
+    config = transform_to_config(transform)
+    fingerprint = _fingerprint(config) if config is not None else artifact_hash
+    base = name or _transform_name(transform)
+    versioned = _register_name(registry_path, base, fingerprint) if registry_path else base
+    return {
+        "name": versioned,
+        "base_name": base,
+        "path": path.name,
+        "format": "pickle",
+        "sha256": artifact_hash,
+        "fingerprint": fingerprint,
+        "config": config,
+    }
+
+
+def load_transform(path: str | Path, meta: dict[str, Any] | None = None) -> Transform:
+    path = Path(path)
+    expected = (meta or {}).get("sha256")
+    if expected is not None and _sha256_file(path) != expected:
+        raise ValueError(f"transform hash mismatch: {path}")
+    with path.open("rb") as f:
+        return pickle.load(f)
+
+
+def transform_to_config(transform: Transform) -> dict[str, Any] | None:
+    if isinstance(transform, Passthrough):
+        return {"type": "Passthrough"}
+    if isinstance(transform, Standardizer):
+        return {"type": "Standardizer", **_json_ready(asdict(transform))}
+    if isinstance(transform, (Chain, ComposeTransform)):
+        return {
+            "type": type(transform).__name__,
+            "steps": [transform_to_config(step) for step in transform.steps],
+        }
+    if isinstance(transform, FunctionTransform):
+        fn = transform.fn
+        return {
+            "type": "FunctionTransform",
+            "fn": _callable_info(fn),
+        }
+    if is_dataclass(transform):
+        return {"type": type(transform).__name__, **_json_ready(asdict(transform))}
+    return None
+
+
+def _callable_info(fn: Callable[..., Any]) -> dict[str, Any]:
+    info = {
+        "name": getattr(fn, "__name__", None),
+        "module": getattr(fn, "__module__", None),
+        "qualname": getattr(fn, "__qualname__", None),
+        "description": inspect.getdoc(fn),
+    }
+    try:
+        info["source"] = inspect.getsource(fn)
+    except (OSError, TypeError):
+        info["source"] = None
+    return info
+
+
+def _transform_name(transform: Transform) -> str:
+    if isinstance(transform, FunctionTransform):
+        return _snake(getattr(transform.fn, "__name__", "function_transform"))
+    return _snake(type(transform).__name__)
+
+
+def _register_name(path: str | Path | None, base: str, fingerprint: str) -> str:
+    if path is None:
+        return base
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    registry = _read_json(path, {})
+    if registry.get(base) == fingerprint:
+        return base
+    if base not in registry:
+        registry[base] = fingerprint
+        _write_json(path, registry)
+        return base
+    n = 2
+    while True:
+        name = f"{base}_v{n}"
+        if registry.get(name) == fingerprint:
+            return name
+        if name not in registry:
+            registry[name] = fingerprint
+            _write_json(path, registry)
+            return name
+        n += 1
+
+
+def _fingerprint(config: dict[str, Any]) -> str:
+    blob = json.dumps(_json_ready(config), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _pickle_dump(obj: Any, f: Any) -> None:
+    try:
+        import cloudpickle
+    except ImportError:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+    else:
+        cloudpickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    with path.open() as f:
+        return json.load(f)
+
+
+def _write_json(path: Path, obj: Any) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w") as f:
+        json.dump(_json_ready(obj), f, indent=2, sort_keys=True)
+        f.write("\n")
+    tmp.replace(path)
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return repr(value)
+
+
+def _snake(name: str) -> str:
+    name = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
+    name = re.sub(r"[^0-9a-zA-Z]+", "_", name)
+    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name).strip("_").lower()

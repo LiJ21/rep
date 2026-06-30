@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import pickle
 import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -41,8 +43,35 @@ class ModelAdapter(Protocol):
         keep_predictions: bool = False,
     ) -> tuple[float, dict[str, Any], np.ndarray | None]: ...
 
+    def save_model(self, model: Any, path: str | Path) -> dict[str, Any]: ...
+
+    def load_model(self, path: str | Path, meta: dict[str, Any] | None = None) -> Any: ...
+
 
 class BaseAdapter:
+    def save_model(self, model: Any, path: str | Path) -> dict[str, Any]:
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        artifact = path / "model.pkl"
+        with artifact.open("wb") as f:
+            pickle.dump(model, f, protocol=pickle.HIGHEST_PROTOCOL)
+        return {
+            "format": "pickle",
+            "artifact": artifact.name,
+            "sha256": _sha256_file(artifact),
+        }
+
+    def load_model(self, path: str | Path, meta: dict[str, Any] | None = None) -> Any:
+        path = Path(path)
+        artifact = (
+            path / (meta or {}).get("artifact", "model.pkl")
+            if path.is_dir()
+            else path
+        )
+        _check_hash(artifact, meta)
+        with artifact.open("rb") as f:
+            return pickle.load(f)
+
     def evaluate(
         self,
         model: Any,
@@ -175,6 +204,34 @@ class XGBoostAdapter(BaseAdapter):
 
     def predict(self, model: Any, x: np.ndarray) -> np.ndarray:
         return np.asarray(model.inplace_predict(x))
+
+    def save_model(self, model: Any, path: str | Path) -> dict[str, Any]:
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        artifact = path / "model.ubj"
+        model.save_model(str(artifact))
+        return {
+            "format": "xgboost_ubj",
+            "artifact": artifact.name,
+            "sha256": _sha256_file(artifact),
+        }
+
+    def load_model(self, path: str | Path, meta: dict[str, Any] | None = None) -> Any:
+        try:
+            import xgboost as xgb
+        except ImportError as exc:
+            raise ImportError("XGBoostAdapter requires xgboost.") from exc
+
+        path = Path(path)
+        artifact = (
+            path / (meta or {}).get("artifact", "model.ubj")
+            if path.is_dir()
+            else path
+        )
+        _check_hash(artifact, meta)
+        booster = xgb.Booster()
+        booster.load_model(str(artifact))
+        return booster
 
     def _dmatrix(
         self,
@@ -925,6 +982,43 @@ class TorchAdapter(BaseAdapter):
             xb = torch.as_tensor(x, dtype=torch.float32, device=device)
             return model(xb).detach().cpu().numpy().reshape(-1)
 
+    def save_model(self, model: Any, path: str | Path) -> dict[str, Any]:
+        import torch
+
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        artifact = path / "model.pt"
+        module = model.module if hasattr(model, "module") else model
+        torch.save(
+            {
+                "params": getattr(module, "_pipeline_params", {}),
+                "state_dict": module.state_dict(),
+            },
+            artifact,
+        )
+        return {
+            "format": "torch_state_dict",
+            "artifact": artifact.name,
+            "sha256": _sha256_file(artifact),
+        }
+
+    def load_model(self, path: str | Path, meta: dict[str, Any] | None = None) -> Any:
+        import torch
+
+        path = Path(path)
+        artifact = (
+            path / (meta or {}).get("artifact", "model.pt")
+            if path.is_dir()
+            else path
+        )
+        _check_hash(artifact, meta)
+        payload = torch.load(artifact, map_location=self.device or "cpu")
+        model = self.build(payload.get("params", {}))
+        model.load_state_dict(payload["state_dict"])
+        if self.device is not None:
+            model = model.to(self.device)
+        return model
+
     def _loader(self, torch: Any, src: "DataSource", rank: int, world_size: int):
         batch_size = self.batch_size
 
@@ -954,3 +1048,17 @@ class TorchAdapter(BaseAdapter):
         if self.distributed and torch.distributed.is_available() and torch.distributed.is_initialized():
             return torch.distributed.get_rank(), torch.distributed.get_world_size()
         return 0, 1
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _check_hash(path: Path, meta: dict[str, Any] | None) -> None:
+    expected = (meta or {}).get("sha256")
+    if expected is not None and _sha256_file(path) != expected:
+        raise ValueError(f"model hash mismatch: {path}")

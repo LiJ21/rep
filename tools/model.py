@@ -45,7 +45,9 @@ class ModelAdapter(Protocol):
 
     def save_model(self, model: Any, path: str | Path) -> dict[str, Any]: ...
 
-    def load_model(self, path: str | Path, meta: dict[str, Any] | None = None) -> Any: ...
+    def load_model(
+        self, path: str | Path, meta: dict[str, Any] | None = None
+    ) -> Any: ...
 
 
 class BaseAdapter:
@@ -64,9 +66,7 @@ class BaseAdapter:
     def load_model(self, path: str | Path, meta: dict[str, Any] | None = None) -> Any:
         path = Path(path)
         artifact = (
-            path / (meta or {}).get("artifact", "model.pkl")
-            if path.is_dir()
-            else path
+            path / (meta or {}).get("artifact", "model.pkl") if path.is_dir() else path
         )
         _check_hash(artifact, meta)
         with artifact.open("rb") as f:
@@ -224,9 +224,7 @@ class XGBoostAdapter(BaseAdapter):
 
         path = Path(path)
         artifact = (
-            path / (meta or {}).get("artifact", "model.ubj")
-            if path.is_dir()
-            else path
+            path / (meta or {}).get("artifact", "model.ubj") if path.is_dir() else path
         )
         _check_hash(artifact, meta)
         booster = xgb.Booster()
@@ -486,7 +484,11 @@ class LarsAdapter(BaseAdapter):
                 positive=model.positive,
                 return_path=True,
             )
-            cached = (np.asarray(alphas), [int(i) for i in active], np.asarray(coefs_path))
+            cached = (
+                np.asarray(alphas),
+                [int(i) for i in active],
+                np.asarray(coefs_path),
+            )
             if key is not None:
                 self._path_cache[key] = cached
         model.alphas, model.active, model.coefs_path = cached
@@ -495,7 +497,9 @@ class LarsAdapter(BaseAdapter):
         model.x_mean = x_mean
         model.y_mean = y_mean
         model.coef = self._coef_at(model.alphas, model.coefs_path, model.alpha)
-        model.intercept = float(y_mean - x_mean @ model.coef) if model.fit_intercept else 0.0
+        model.intercept = (
+            float(y_mean - x_mean @ model.coef) if model.fit_intercept else 0.0
+        )
         if tracker is not None:
             tracker.log(
                 {
@@ -566,7 +570,9 @@ class LarsAdapter(BaseAdapter):
                     raise MemoryError(
                         f"LarsAdapter got {x.shape[1]} features; max_features={self.max_features}"
                     )
-                stats = _LinearStats.empty(x.shape[1], self._stats_xp(), self.stats_dtype)
+                stats = _LinearStats.empty(
+                    x.shape[1], self._stats_xp(), self.stats_dtype
+                )
             stats.add(x, y)
 
         if stats is None or stats.n == 0:
@@ -670,8 +676,7 @@ class LarsAdapter(BaseAdapter):
         if any(state is None for state in states):
             raise ValueError("cannot score empty prediction stream")
         return {
-            alpha: (float(state), dict(ctx))
-            for alpha, state in zip(alphas, states)
+            alpha: (float(state), dict(ctx)) for alpha, state in zip(alphas, states)
         }
 
     def _stats_xp(self) -> Any:
@@ -689,7 +694,9 @@ class LarsAdapter(BaseAdapter):
         raise ValueError("stats_backend must be one of: 'cpu', 'numpy', 'cupy', 'gpu'")
 
     @staticmethod
-    def _coef_at(alphas: np.ndarray, coefs_path: np.ndarray, alpha: float) -> np.ndarray:
+    def _coef_at(
+        alphas: np.ndarray, coefs_path: np.ndarray, alpha: float
+    ) -> np.ndarray:
         if len(alphas) == 1:
             return coefs_path[:, 0].copy()
         if alpha < alphas[-1]:
@@ -699,7 +706,9 @@ class LarsAdapter(BaseAdapter):
                 stacklevel=2,
             )
         xp = alphas[::-1]
-        return np.array([np.interp(alpha, xp, row[::-1]) for row in coefs_path], dtype=float)
+        return np.array(
+            [np.interp(alpha, xp, row[::-1]) for row in coefs_path], dtype=float
+        )
 
 
 @dataclass
@@ -801,7 +810,9 @@ class RidgeAdapter(BaseAdapter):
                     raise MemoryError(
                         f"RidgeAdapter got {x.shape[1]} features; max_features={self.max_features}"
                     )
-                stats = _LinearStats.empty(x.shape[1], self._stats_xp(), self.stats_dtype)
+                stats = _LinearStats.empty(
+                    x.shape[1], self._stats_xp(), self.stats_dtype
+                )
             stats.add(x, y)
 
         if stats is None or stats.n == 0:
@@ -905,9 +916,16 @@ class _LinearStats:
         self.y_sum += float(self._cpu(y.sum()).item())
         self.n += len(y)
 
-    def centered(self, fit_intercept: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    def centered(
+        self, fit_intercept: bool
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
         if not fit_intercept:
-            return self._cpu(self.xtx), self._cpu(self.xty), np.zeros(self.n_features), 0.0
+            return (
+                self._cpu(self.xtx),
+                self._cpu(self.xty),
+                np.zeros(self.n_features),
+                0.0,
+            )
         x_mean = self.x_sum / self.n
         y_mean = self.y_sum / self.n
         gram = self.xtx - self.xp.outer(self.x_sum, self.x_sum) / self.n
@@ -947,7 +965,9 @@ class TorchAdapter(BaseAdapter):
     ) -> Any:
         import torch
 
-        device = torch.device(self.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        device = torch.device(
+            self.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        )
         rank, world_size = self._rank_world(torch)
         model_params = getattr(model, "_pipeline_params", {})
         model = model.to(device)
@@ -957,6 +977,7 @@ class TorchAdapter(BaseAdapter):
         optimizer = self._optimizer(torch, model, model_params)
 
         for epoch in range(self.epochs):
+            print(f"======== Torch Adapter -- Epoch {epoch}")
             model.train()
             losses = []
             for xb, yb in self._loader(torch, train, rank, world_size):
@@ -969,7 +990,13 @@ class TorchAdapter(BaseAdapter):
                 losses.append(float(loss.detach().cpu()))
             metrics = {"torch/train_loss": float(np.mean(losses)) if losses else 0.0}
             if val is not None:
-                metrics["torch/val_loss"] = self._eval_loss(torch, model, val, loss_fn, device)
+                metrics["torch/val_loss"] = self._eval_loss(
+                    torch, model, val, loss_fn, device
+                )
+            print(
+                f"======== Torch Adapter -- train loss = {metrics['train_loss']}"
+                + (f", val loss = {metrics['val_loss']}" if val is not None else "")
+            )
             tracker.log(metrics, step=epoch)
         return model
 
@@ -979,6 +1006,7 @@ class TorchAdapter(BaseAdapter):
         device = next(model.parameters()).device
         model.eval()
         with torch.inference_mode():
+            x = _writable_array(x, dtype=np.float32)
             xb = torch.as_tensor(x, dtype=torch.float32, device=device)
             return model(xb).detach().cpu().numpy().reshape(-1)
 
@@ -1007,9 +1035,7 @@ class TorchAdapter(BaseAdapter):
 
         path = Path(path)
         artifact = (
-            path / (meta or {}).get("artifact", "model.pt")
-            if path.is_dir()
-            else path
+            path / (meta or {}).get("artifact", "model.pt") if path.is_dir() else path
         )
         _check_hash(artifact, meta)
         payload = torch.load(artifact, map_location=self.device or "cpu")
@@ -1026,11 +1052,17 @@ class TorchAdapter(BaseAdapter):
             def __iter__(self):
                 for i, (x, y, _) in enumerate(src.batches(batch_size)):
                     if i % world_size == rank:
-                        yield torch.as_tensor(x, dtype=torch.float32), torch.as_tensor(y)
+                        x = _writable_array(x, dtype=np.float32)
+                        y = _writable_array(y)
+                        yield torch.as_tensor(x, dtype=torch.float32), torch.as_tensor(
+                            y
+                        )
 
         return torch.utils.data.DataLoader(SourceDataset(), batch_size=None)
 
-    def _eval_loss(self, torch: Any, model: Any, src: "DataSource", loss_fn: Any, device: Any) -> float:
+    def _eval_loss(
+        self, torch: Any, model: Any, src: "DataSource", loss_fn: Any, device: Any
+    ) -> float:
         losses = []
         model.eval()
         with torch.inference_mode():
@@ -1045,9 +1077,18 @@ class TorchAdapter(BaseAdapter):
         return torch.optim.Adam(model.parameters(), lr=float(params.get("lr", 1e-3)))
 
     def _rank_world(self, torch: Any) -> tuple[int, int]:
-        if self.distributed and torch.distributed.is_available() and torch.distributed.is_initialized():
+        if (
+            self.distributed
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
             return torch.distributed.get_rank(), torch.distributed.get_world_size()
         return 0, 1
+
+
+def _writable_array(x: Any, dtype: Any | None = None) -> np.ndarray:
+    arr = np.asarray(x, dtype=dtype)
+    return arr if arr.flags.writeable else arr.copy()
 
 
 def _sha256_file(path: Path) -> str:

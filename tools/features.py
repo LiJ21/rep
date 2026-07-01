@@ -1,23 +1,32 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping, Sequence
-from datetime import timedelta
-from math import isfinite
-from numbers import Real
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 
 from tools.data import _mask
+from tools.features_recipe import (
+    EwmaCarryover,
+    EwmaFeature,
+    ExprFeature,
+    TradeMomentum,
+)
 from tools.orderbook import depth_batches, depth_table_from_arrow
 
 
 UNDEF_PRICE = 9_223_372_036_854_775_807
 Frame = pl.DataFrame | pl.LazyFrame
 Source = Frame | str | Path
-HalfLife = str | timedelta | int | float
 __all__ = [
     "LOBFeatures",
+    "EwmaCarryover",
+    "EwmaFeature",
+    "ExprFeature",
+    "StatefulFeature",
+    "TradeMomentum",
     "add_features",
     "compute_features",
     "depth_meta",
@@ -40,6 +49,28 @@ def compute_features(
 
 def add_features(lf: pl.LazyFrame, feature_exprs: Mapping[str, pl.Expr]) -> pl.LazyFrame:
     return lf.with_columns([expr.alias(name) for name, expr in feature_exprs.items()])
+
+
+class StatefulFeature(ABC):
+    name: str
+
+    @abstractmethod
+    def apply(self, lf: pl.LazyFrame, carryover: Any | None) -> pl.LazyFrame:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_carryover(self, df: pl.DataFrame) -> Any | None:
+        raise NotImplementedError
+
+    def internal_cols(self) -> list[str]:
+        return []
+
+    def to_config(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "kind": "stateful_feature",
+            "type": type(self).__name__,
+        }
 
 
 def depth_meta(n: int = 1) -> list[str]:
@@ -68,50 +99,6 @@ class LOBFeatures:
         bid = LOBFeatures._inv_distance_volume("bid", depth, mid, half_spread)
         ask = LOBFeatures._inv_distance_volume("ask", depth, mid, half_spread)
         return LOBFeatures._diff(bid, ask, log, eps)
-
-    @staticmethod
-    def ewma(feature: pl.Expr, half_life: HalfLife, time: str = "ts_event") -> pl.Expr:
-        return feature.cast(pl.Float64).ewm_mean_by(
-            pl.col(time),
-            half_life=LOBFeatures._half_life(half_life),
-        )
-
-    @staticmethod
-    def trade_momentum(
-        half_life: HalfLife,
-        log: bool = False,
-        eps: float = 1e-12,
-        time: str = "ts_event",
-    ) -> pl.Expr:
-        buy = (
-            pl.when(pl.col("trade_side") == 0)
-            .then(pl.col("trade_sz").cast(pl.Float64))
-            .otherwise(0.0)
-        )
-        sell = (
-            pl.when(pl.col("trade_side") == 1)
-            .then(pl.col("trade_sz").cast(pl.Float64))
-            .otherwise(0.0)
-        )
-        buy = LOBFeatures.ewma(buy, half_life, time)
-        sell = LOBFeatures.ewma(sell, half_life, time)
-        return LOBFeatures._diff(buy, sell, log, eps)
-
-    @staticmethod
-    def _half_life(half_life: HalfLife) -> str | timedelta:
-        if isinstance(half_life, bool):
-            raise TypeError("half_life must be a duration string, timedelta, or positive seconds")
-        if isinstance(half_life, Real):
-            seconds = float(half_life)
-            if not isfinite(seconds) or seconds <= 0:
-                raise ValueError("numeric half_life is in seconds and must be positive")
-            ns = round(seconds * 1_000_000_000)
-            if ns <= 0:
-                raise ValueError("numeric half_life is in seconds and must be at least 0.5ns")
-            return f"{ns}ns"
-        if isinstance(half_life, (str, timedelta)):
-            return half_life
-        raise TypeError("half_life must be a duration string, timedelta, or positive seconds")
 
     @staticmethod
     def size_weighted_price_gap(
@@ -179,6 +166,9 @@ class LOBFeatures:
             cost += take * px
             remaining -= take
         return pl.when(qty > 0).then(cost / qty).otherwise(None)
+
+
+LOBFeatures.TradeMomentum = TradeMomentum
 
 
 def mbo_to_features(

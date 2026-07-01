@@ -30,6 +30,8 @@ def add_future_price(
     by: Sequence[str] = ("publisher_id", "instrument_id"),
 ) -> Frame:
     horizons, weights = _weighted_horizons(horizons, weights)
+    if len(horizons) == 0:
+        return df
     lazy = isinstance(df, pl.LazyFrame)
     lf = df if lazy else df.lazy()
     join_by = [c for c in by if c in lf.collect_schema().names()]
@@ -111,9 +113,10 @@ def add_return(
 ) -> Frame:
     lazy = isinstance(df, pl.LazyFrame)
     out = add_future_price(df, expr, horizons, weights, time, "__future_price", by).lazy()
-    out = out.with_columns(expr.cast(pl.Float64).alias("__price"))
-    out = out.with_columns(((pl.col("__future_price") / pl.col("__price") - 1.0) * 10_000).alias(name))
-    out = out.drop("__future_price", "__price")
+    if "__future_price" in out.collect_schema():
+        out = out.with_columns(expr.cast(pl.Float64).alias("__price"))
+        out = out.with_columns(((pl.col("__future_price") / pl.col("__price") - 1.0) * 10_000).alias(name))
+        out = out.drop("__future_price", "__price")
     return out if lazy else out.collect(engine="streaming")
 
 
@@ -157,6 +160,8 @@ def _weighted_horizons(
 ) -> tuple[list[str], list[float]]:
     horizons = [horizons] if isinstance(horizons, str) else list(horizons)
     weights = [weights] * len(horizons) if isinstance(weights, (int, float)) else list(weights)
-    if len(horizons) != len(weights) or not horizons:
-        raise ValueError("horizons and weights must be non-empty and equal length")
+    # if len(horizons) != len(weights) or not horizons:
+    #     raise ValueError("horizons and weights must be non-empty and equal length")
+    if len(horizons) != len(weights):
+        raise ValueError("horizons and weights must be equal length")
     return horizons, weights

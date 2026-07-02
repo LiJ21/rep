@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -61,8 +62,10 @@ class ExprFeature:
         )
         self._validate_tree()
 
-    def apply(self, lf: pl.LazyFrame, carryover: Any | None) -> pl.LazyFrame:
-        lf = self._apply_subfeatures(lf, carryover)
+    def apply(
+        self, lf: pl.LazyFrame, carryover: Any | None, front_pad: int = 0
+    ) -> pl.LazyFrame:
+        lf = self._apply_subfeatures(lf, carryover, front_pad=front_pad)
         return lf.with_columns(self.expr.alias(self.name))
 
     def get_carryover(self, df: pl.DataFrame) -> dict[str, Any] | None:
@@ -88,11 +91,16 @@ class ExprFeature:
         }
 
     def _apply_subfeatures(
-        self, lf: pl.LazyFrame, carryover: Any | None
+        self, lf: pl.LazyFrame, carryover: Any | None, front_pad: int = 0
     ) -> pl.LazyFrame:
         child_carryovers = _child_carryovers(carryover)
         for feature in self.sub_features:
-            lf = feature.apply(lf, child_carryovers.get(feature.name))
+            lf = _apply_feature(
+                feature,
+                lf,
+                child_carryovers.get(feature.name),
+                front_pad=front_pad,
+            )
         return lf
 
     def _get_child_carryovers(self, df: pl.DataFrame) -> dict[str, Any]:
@@ -120,8 +128,10 @@ class EwmaFeature(ExprFeature):
     time: str = "ts_event"
     normalized: bool = True
 
-    def apply(self, lf: pl.LazyFrame, carryover: Any | None) -> pl.LazyFrame:
-        lf = self._apply_subfeatures(lf, carryover)
+    def apply(
+        self, lf: pl.LazyFrame, carryover: Any | None, front_pad: int = 0
+    ) -> pl.LazyFrame:
+        lf = self._apply_subfeatures(lf, carryover, front_pad=front_pad)
         own_carryover = _own_carryover(carryover)
 
         seed_col = self._col("seed")
@@ -136,6 +146,15 @@ class EwmaFeature(ExprFeature):
             .alias(time_col),
             self.expr.cast(pl.Float64).alias(input_col),
         )
+        if own_carryover is not None and front_pad > 0:
+            return self._apply_front_padded_ewm(
+                lf,
+                own_carryover,
+                seed_col,
+                time_col,
+                input_col,
+                front_pad,
+            )
         if own_carryover is not None:
             seed = pl.DataFrame(
                 {
@@ -150,6 +169,48 @@ class EwmaFeature(ExprFeature):
             self._ewm_expr(input_col, time_col).alias(self.name)
         )
         return lf.filter(~pl.col(seed_col)) if own_carryover is not None else lf
+
+    def _apply_front_padded_ewm(
+        self,
+        lf: pl.LazyFrame,
+        own_carryover: EwmaCarryover,
+        seed_col: str,
+        time_col: str,
+        input_col: str,
+        front_pad: int,
+    ) -> pl.LazyFrame:
+        order_col = self._col("front_order")
+        seed_idx = front_pad - 1
+        lf = lf.with_row_index(order_col)
+        active = (
+            lf.filter(pl.col(order_col) >= seed_idx)
+            .with_columns(
+                pl.when(pl.col(order_col) == seed_idx)
+                .then(True)
+                .otherwise(pl.col(seed_col))
+                .alias(seed_col),
+                pl.when(pl.col(order_col) == seed_idx)
+                .then(pl.lit(own_carryover.time_ns))
+                .otherwise(pl.col(time_col))
+                .alias(time_col),
+                pl.when(pl.col(order_col) == seed_idx)
+                .then(pl.lit(own_carryover.value))
+                .otherwise(pl.col(input_col))
+                .alias(input_col),
+            )
+            .with_columns(self._ewm_expr(input_col, time_col).alias(self.name))
+        )
+        if front_pad <= 1:
+            return active.drop(order_col)
+
+        inactive = lf.filter(pl.col(order_col) < seed_idx).with_columns(
+            pl.lit(None, dtype=pl.Float64).alias(self.name)
+        )
+        return (
+            pl.concat([inactive, active], how="diagonal_relaxed")
+            .sort(order_col)
+            .drop(order_col)
+        )
 
     def get_carryover(self, df: pl.DataFrame) -> dict[str, Any] | None:
         out: dict[str, Any] = {}
@@ -279,9 +340,11 @@ class BuySellMomentum(ExprFeature):
         object.__setattr__(self, "normalized", normalized)
         self._validate_tree()
 
-    def apply(self, lf: pl.LazyFrame, carryover: Any | None) -> pl.LazyFrame:
+    def apply(
+        self, lf: pl.LazyFrame, carryover: Any | None, front_pad: int = 0
+    ) -> pl.LazyFrame:
         if self.mode == "trade":
-            return super().apply(lf, carryover)
+            return super().apply(lf, carryover, front_pad=front_pad)
 
         time_col = self._col("time_ns")
         lf = lf.with_columns(
@@ -290,7 +353,7 @@ class BuySellMomentum(ExprFeature):
             .dt.epoch("ns")
             .alias(time_col),
         )
-        return super().apply(lf, carryover)
+        return super().apply(lf, carryover, front_pad=front_pad)
 
     def internal_cols(self) -> list[str]:
         cols = super().internal_cols()
@@ -408,6 +471,20 @@ def _own_carryover(carryover: Any | None) -> Any | None:
 
 def _copy_sub_features(sub_features: Sequence[Any]) -> tuple[Any, ...]:
     return tuple(copy.copy(feature) for feature in sub_features)
+
+
+def _apply_feature(
+    feature: Any,
+    lf: pl.LazyFrame,
+    carryover: Any | None,
+    front_pad: int,
+) -> pl.LazyFrame:
+    sig = inspect.signature(feature.apply)
+    if "front_pad" in sig.parameters or any(
+        p.kind == p.VAR_KEYWORD for p in sig.parameters.values()
+    ):
+        return feature.apply(lf, carryover, front_pad=front_pad)
+    return feature.apply(lf, carryover)
 
 
 def _feature_tree_names(feature: Any) -> list[str]:

@@ -20,6 +20,7 @@ RAW_PATH = str(
     / "data/databento_glbx_mdp3_mbo_full_day_parquet/{prod}M6_{d}_{tag}_{prod_s}_full_day.parquet"
 )
 CTX_COLS = ("date", "nature")
+FRONT_PAD_COL = "__load_front_pad"
 
 BUY = 0
 SELL = 1
@@ -56,11 +57,17 @@ class LoadHint:
     batch_size: int | None = None
     polars_engine: str = "streaming"
     state: LoadState = field(default_factory=LoadState)
+    front_pad: int = 0
+
+    def __post_init__(self) -> None:
+        if self.front_pad < 0:
+            raise ValueError("front_pad must be nonnegative")
 
 
 Loader = Callable[[list[str]], list[DateFrame]]
 Batch = tuple[np.ndarray, np.ndarray, dict[str, Any]]
 POLARS_ENGINES = {"auto", "streaming", "gpu"}
+Window = tuple[int, int, int, int, int, pl.DataFrame | None]
 
 
 def expand_dates(
@@ -299,6 +306,10 @@ class DataSource:
         )
         if self.filters:
             lf = lf.filter(_mask(self.filters))
+        if FRONT_PAD_COL in lf.collect_schema():
+            lf = lf.filter(~pl.col(FRONT_PAD_COL).fill_null(False)).drop(
+                FRONT_PAD_COL
+            )
         if self.transform is not None:
             lf = self.transform.transform(lf)
         if not select:
@@ -450,7 +461,7 @@ class FeatureLoader:
         d: str,
         fpath: str,
         tag: str,
-        window: tuple[int, int, int, int, pl.DataFrame | None] | None = None,
+        window: Window | None = None,
         carryovers: Mapping[str, Any] | None = None,
     ) -> DateFrame:
         from tools.features import mbo_to_features
@@ -460,7 +471,7 @@ class FeatureLoader:
             raw = pl.scan_parquet(fpath)
             if window is not None:
                 raw = raw.with_row_index("__load_row")
-                if self.stateful_features:
+                if self.stateful_features or self._actual_front_pad(window) > 0:
                     raw = self._filter_window(raw, window)
             lf = mbo_to_features(
                 raw, self.feature_exprs, self.filters, context_cols=self.context_cols
@@ -476,10 +487,18 @@ class FeatureLoader:
             )
             lf = pl.concat(list(parts), how="vertical_relaxed").lazy()
 
-        if window is not None and not self.stateful_features:
+        if (
+            window is not None
+            and not self.stateful_features
+            and self._actual_front_pad(window) == 0
+        ):
             lf = self._filter_window(lf, window)
 
-        lf = self._push_stateful_features(lf, carryovers)
+        lf = self._push_stateful_features(
+            lf,
+            carryovers,
+            front_pad=self._actual_front_pad(window) if window is not None else 0,
+        )
 
         if window is not None and (self.return_exprs or self.executable_returns):
             lf = self._append_window_sentinels(lf, window)
@@ -506,10 +525,17 @@ class FeatureLoader:
                 self.return_by,
             )
         if window is not None:
-            start, stop, _, _, _ = window
+            start, stop, _, _, actual_front_pad, _ = window
+            front_start = start - actual_front_pad
             lf = lf.filter(
-                (pl.col("__load_row") >= start) & (pl.col("__load_row") < stop)
-            ).drop("__load_row")
+                (pl.col("__load_row") >= front_start)
+                & (pl.col("__load_row") < stop)
+            )
+            if actual_front_pad > 0:
+                lf = lf.with_columns(
+                    (pl.col("__load_row") < start).alias(FRONT_PAD_COL)
+                )
+            lf = lf.drop("__load_row")
         if self.meta_cols is not None:
             cols = [
                 *self.meta_cols,
@@ -518,6 +544,8 @@ class FeatureLoader:
                 *self.return_exprs,
                 *self.executable_returns,
             ]
+            if window is not None and self._actual_front_pad(window) > 0:
+                cols.append(FRONT_PAD_COL)
             lf = lf.select(_ordered_unique(cols))
         return DateFrame(
             date=d,
@@ -567,6 +595,7 @@ class FeatureLoader:
             start = int(df.get_column("__load_row")[0])
             stop = int(df.get_column("__load_row")[-1]) + 1
             end_t_ns = int(df.get_column("__load_t_ns")[-1])
+            actual_front_pad = min(hint.front_pad, start)
             carryovers = {
                 feature.name: hint.state.get(feature)
                 for feature in self.stateful_features
@@ -575,18 +604,26 @@ class FeatureLoader:
                 d,
                 fpath,
                 tag,
-                (start, stop, end_t_ns, pad_ns, group_max_times),
+                (
+                    start,
+                    stop,
+                    end_t_ns,
+                    pad_ns,
+                    actual_front_pad,
+                    group_max_times,
+                ),
                 carryovers,
             )
 
     def _filter_window(
         self,
         lf: pl.LazyFrame,
-        window: tuple[int, int, int, int, pl.DataFrame | None],
+        window: Window,
     ) -> pl.LazyFrame:
-        start, _, end_t_ns, pad_ns, _ = window
+        start, _, end_t_ns, pad_ns, actual_front_pad, _ = window
+        front_start = start - actual_front_pad
         return lf.filter(
-            (pl.col("__load_row") >= start)
+            (pl.col("__load_row") >= front_start)
             & (
                 pl.col(self.return_time).cast(pl.Datetime("ns")).dt.epoch("ns")
                 <= end_t_ns + pad_ns
@@ -596,9 +633,9 @@ class FeatureLoader:
     def _append_window_sentinels(
         self,
         lf: pl.LazyFrame,
-        window: tuple[int, int, int, int, pl.DataFrame | None],
+        window: Window,
     ) -> pl.LazyFrame:
-        _, stop, end_t_ns, pad_ns, group_max_times = window
+        _, stop, end_t_ns, pad_ns, _, group_max_times = window
         if pad_ns <= 0:
             return lf
 
@@ -664,11 +701,17 @@ class FeatureLoader:
         return lf.select(max_t).collect(engine=polars_engine)
 
     def _push_stateful_features(
-        self, lf: pl.LazyFrame, carryovers: Mapping[str, Any] | None
+        self,
+        lf: pl.LazyFrame,
+        carryovers: Mapping[str, Any] | None,
+        front_pad: int = 0,
     ) -> pl.LazyFrame:
         for feature in self.stateful_features:
             carryover = carryovers.get(feature.name) if carryovers is not None else None
-            lf = feature.apply(lf, carryover)
+            if _accepts_kw(feature.apply, "front_pad"):
+                lf = feature.apply(lf, carryover, front_pad=front_pad)
+            else:
+                lf = feature.apply(lf, carryover)
         return lf
 
     def _stateful_feature_names(self) -> list[str]:
@@ -680,8 +723,15 @@ class FeatureLoader:
             and hint.batch_size is not None
             and hint.batch_size > 0
             and self.l2_depth is None
-            and bool(self.return_exprs or self.executable_returns)
+            and bool(
+                hint.front_pad > 0
+                or self.return_exprs
+                or self.executable_returns
+            )
         )
+
+    def _actual_front_pad(self, window: Window) -> int:
+        return window[4]
 
     def _max_horizon_ns(self) -> int:
         from tools.price import _duration_ns

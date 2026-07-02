@@ -61,7 +61,9 @@ class StatefulFeature(ABC):
     name: str
 
     @abstractmethod
-    def apply(self, lf: pl.LazyFrame, carryover: Any | None) -> pl.LazyFrame:
+    def apply(
+        self, lf: pl.LazyFrame, carryover: Any | None, front_pad: int = 0
+    ) -> pl.LazyFrame:
         raise NotImplementedError
 
     @abstractmethod

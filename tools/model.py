@@ -994,8 +994,8 @@ class TorchAdapter(BaseAdapter):
                     torch, model, val, loss_fn, device
                 )
             print(
-                f"======== Torch Adapter -- train loss = {metrics['train_loss']}"
-                + (f", val loss = {metrics['val_loss']}" if val is not None else "")
+                f"======== Torch Adapter -- train loss = {metrics['torch/train_loss']}"
+                + (f", val loss = {metrics['torch/val_loss']}" if val is not None else "")
             )
             tracker.log(metrics, step=epoch)
         return model

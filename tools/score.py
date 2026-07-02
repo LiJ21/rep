@@ -120,13 +120,13 @@ def unit_pnl(
     y = np.asarray(y_true, dtype=float)
     p = np.asarray(y_pred, dtype=float)
     mask = np.abs(p) > threshold
-    pnl = float(np.sum(np.sign(p[mask]) * p[mask] ** power * y[mask]))
+    pnl = float(np.sum(np.sign(p[mask]) * np.abs(p[mask]) ** power * y[mask]))
     n = int(len(p[mask]))
-    norm = float(np.sum(p[mask] ** power))
+    norm = float(np.sum(np.abs(p[mask]) ** power)) if power != 0 else n
     if combine_with is not _NO_COMBINE and combine_with is not None:
         pnl += float(getattr(combine_with, "state", {}).get("pnl", 0.0))
         n += int(getattr(combine_with, "n", 0))
-        norm += float(getattr(combine_with, "norm", 0))
+        norm += float(getattr(combine_with, "state", {}).get("norm", 0.0))
     score = pnl / norm if norm else 0.0
     if ctx is not None:
         ctx["n_active"] = n

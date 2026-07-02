@@ -9,9 +9,12 @@ import polars as pl
 
 from tools.data import _mask
 from tools.features_recipe import (
+    BuySellMomentum,
     EwmaCarryover,
     EwmaFeature,
     ExprFeature,
+    PullMomentum,
+    PushMomentum,
     TradeMomentum,
 )
 from tools.orderbook import depth_batches, depth_table_from_arrow
@@ -22,9 +25,12 @@ Frame = pl.DataFrame | pl.LazyFrame
 Source = Frame | str | Path
 __all__ = [
     "LOBFeatures",
+    "BuySellMomentum",
     "EwmaCarryover",
     "EwmaFeature",
     "ExprFeature",
+    "PullMomentum",
+    "PushMomentum",
     "StatefulFeature",
     "TradeMomentum",
     "add_features",
@@ -168,6 +174,9 @@ class LOBFeatures:
         return pl.when(qty > 0).then(cost / qty).otherwise(None)
 
 
+LOBFeatures.BuySellMomentum = BuySellMomentum
+LOBFeatures.PullMomentum = PullMomentum
+LOBFeatures.PushMomentum = PushMomentum
 LOBFeatures.TradeMomentum = TradeMomentum
 
 

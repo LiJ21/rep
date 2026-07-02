@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
-from math import isfinite
+from math import isfinite, log
 from numbers import Real
 from typing import Any
 
@@ -15,13 +16,29 @@ import polars as pl
 HalfLife = str | timedelta | int | float
 SELF_CARRYOVER = "__self__"
 CHILD_CARRYOVERS = "children"
+_DURATION_RE = re.compile(r"(\d+(?:\.\d*)?|\.\d+)(ns|us|µs|ms|s|m|h|d|w|i)")
+_DURATION_NS = {
+    "ns": 1.0,
+    "us": 1_000.0,
+    "µs": 1_000.0,
+    "ms": 1_000_000.0,
+    "s": 1_000_000_000.0,
+    "m": 60_000_000_000.0,
+    "h": 3_600_000_000_000.0,
+    "d": 86_400_000_000_000.0,
+    "w": 604_800_000_000_000.0,
+    "i": 1.0,
+}
 
 __all__ = [
     "CHILD_CARRYOVERS",
     "SELF_CARRYOVER",
+    "BuySellMomentum",
     "EwmaCarryover",
     "EwmaFeature",
     "ExprFeature",
+    "PullMomentum",
+    "PushMomentum",
     "TradeMomentum",
 ]
 
@@ -101,6 +118,7 @@ class ExprFeature:
 class EwmaFeature(ExprFeature):
     half_life: HalfLife = 1.0
     time: str = "ts_event"
+    normalized: bool = True
 
     def apply(self, lf: pl.LazyFrame, carryover: Any | None) -> pl.LazyFrame:
         lf = self._apply_subfeatures(lf, carryover)
@@ -129,9 +147,7 @@ class EwmaFeature(ExprFeature):
             lf = pl.concat([seed, lf], how="diagonal_relaxed")
 
         lf = lf.with_columns(
-            pl.col(input_col)
-            .ewm_mean_by(pl.col(time_col), half_life=_half_life(self.half_life))
-            .alias(self.name)
+            self._ewm_expr(input_col, time_col).alias(self.name)
         )
         return lf.filter(~pl.col(seed_col)) if own_carryover is not None else lf
 
@@ -160,6 +176,7 @@ class EwmaFeature(ExprFeature):
             **super().to_config(),
             "half_life": _json_ready_half_life(self.half_life),
             "time": self.time,
+            "normalized": self.normalized,
         }
 
     def _get_own_carryover(self, df: pl.DataFrame) -> EwmaCarryover | None:
@@ -171,18 +188,137 @@ class EwmaFeature(ExprFeature):
             return None
         return EwmaCarryover(int(time_ns), float(value))
 
+    def _ewm_expr(self, input_col: str, time_col: str) -> pl.Expr:
+        if self.normalized:
+            return self._normalized_ewm_expr(input_col, time_col)
+        return self._unnormalized_ewm_expr(input_col, time_col)
+
+    def _normalized_ewm_expr(self, input_col: str, time_col: str) -> pl.Expr:
+        return pl.col(input_col).ewm_mean_by(
+            pl.col(time_col),
+            half_life=_half_life(self.half_life),
+        )
+
+    def _unnormalized_ewm_expr(self, input_col: str, time_col: str) -> pl.Expr:
+        input_expr = pl.col(input_col)
+        time_expr = pl.col(time_col)
+        previous_time = time_expr.shift(1)
+        first_at_time = previous_time.is_null() | (time_expr != previous_time)
+
+        group_total = input_expr.sum().over(time_col)
+        group_cumulative = input_expr.cum_sum().over(time_col)
+        adjusted_input = (
+            pl.when(first_at_time)
+            .then(group_total / self._alpha_expr(time_col).fill_null(1.0))
+            .otherwise(0.0)
+        )
+        group_end = adjusted_input.ewm_mean_by(
+            time_expr,
+            half_life=_half_life(self.half_life),
+        )
+        return group_end - (group_total - group_cumulative)
+
+    def _alpha_expr(self, time_col: str) -> pl.Expr:
+        dt = (pl.col(time_col) - pl.col(time_col).shift(1)).cast(pl.Float64)
+        exponent = -log(2.0) * dt / float(_half_life_ns(self.half_life))
+        return 1.0 - exponent.exp()
+
     def _col(self, suffix: str) -> str:
         return f"__{self.name}_{suffix}"
 
 
 @dataclass(frozen=True, init=False)
-class TradeMomentum(ExprFeature):
+class BuySellMomentum(ExprFeature):
+    mode: str
     half_life: HalfLife
     log: bool
     eps: float
     time: str
     unit: bool
+    normalized: bool
 
+    def __init__(
+        self,
+        name: str,
+        half_life: HalfLife,
+        mode: str = "trade",
+        log: bool = False,
+        eps: float = 1e-12,
+        time: str = "ts_event",
+        unit: bool = False,
+        normalized: bool = True,
+    ) -> None:
+        mode = _check_momentum_mode(mode)
+        buy, sell = _momentum_inputs(mode, unit)
+        child_time = time if mode == "trade" else self._col_for(name, "time_ns")
+        buy_ewma = EwmaFeature(
+            name=f"__ewma_{name}_buy",
+            expr=buy,
+            half_life=half_life,
+            time=child_time,
+            normalized=normalized,
+        )
+        sell_ewma = EwmaFeature(
+            name=f"__ewma_{name}_sell",
+            expr=sell,
+            half_life=half_life,
+            time=child_time,
+            normalized=normalized,
+        )
+        expr = _diff(pl.col(buy_ewma.name), pl.col(sell_ewma.name), log, eps)
+
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "expr", expr)
+        object.__setattr__(self, "sub_features", (buy_ewma, sell_ewma))
+        object.__setattr__(self, "mode", mode)
+        object.__setattr__(self, "half_life", half_life)
+        object.__setattr__(self, "log", log)
+        object.__setattr__(self, "eps", eps)
+        object.__setattr__(self, "time", time)
+        object.__setattr__(self, "unit", unit)
+        object.__setattr__(self, "normalized", normalized)
+        self._validate_tree()
+
+    def apply(self, lf: pl.LazyFrame, carryover: Any | None) -> pl.LazyFrame:
+        if self.mode == "trade":
+            return super().apply(lf, carryover)
+
+        time_col = self._col("time_ns")
+        lf = lf.with_columns(
+            pl.col(self.time)
+            .cast(pl.Datetime("ns"))
+            .dt.epoch("ns")
+            .alias(time_col),
+        )
+        return super().apply(lf, carryover)
+
+    def internal_cols(self) -> list[str]:
+        cols = super().internal_cols()
+        if self.mode != "trade":
+            cols.append(self._col("time_ns"))
+        return _ordered_unique(cols)
+
+    def to_config(self) -> dict[str, Any]:
+        return {
+            **super().to_config(),
+            "mode": self.mode,
+            "half_life": _json_ready_half_life(self.half_life),
+            "log": self.log,
+            "eps": self.eps,
+            "time": self.time,
+            "unit": self.unit,
+            "normalized": self.normalized,
+        }
+
+    def _col(self, suffix: str) -> str:
+        return self._col_for(self.name, suffix)
+
+    @staticmethod
+    def _col_for(name: str, suffix: str) -> str:
+        return f"__{name}_{suffix}"
+
+
+class TradeMomentum(BuySellMomentum):
     def __init__(
         self,
         name: str,
@@ -191,42 +327,64 @@ class TradeMomentum(ExprFeature):
         eps: float = 1e-12,
         time: str = "ts_event",
         unit: bool = False,
+        normalized: bool = True,
     ) -> None:
-        buy = _trade_side_input(0, unit)
-        sell = _trade_side_input(1, unit)
-        buy_ewma = EwmaFeature(
-            name=f"__ewma_{name}_buy",
-            expr=buy,
-            half_life=half_life,
+        super().__init__(
+            name,
+            half_life,
+            mode="trade",
+            log=log,
+            eps=eps,
             time=time,
+            unit=unit,
+            normalized=normalized,
         )
-        sell_ewma = EwmaFeature(
-            name=f"__ewma_{name}_sell",
-            expr=sell,
-            half_life=half_life,
+
+
+class PushMomentum(BuySellMomentum):
+    def __init__(
+        self,
+        name: str,
+        half_life: HalfLife,
+        log: bool = False,
+        eps: float = 1e-12,
+        time: str = "ts_event",
+        unit: bool = False,
+        normalized: bool = True,
+    ) -> None:
+        super().__init__(
+            name,
+            half_life,
+            mode="push",
+            log=log,
+            eps=eps,
             time=time,
+            unit=unit,
+            normalized=normalized,
         )
-        expr = _diff(pl.col(buy_ewma.name), pl.col(sell_ewma.name), log, eps)
 
-        object.__setattr__(self, "name", name)
-        object.__setattr__(self, "expr", expr)
-        object.__setattr__(self, "sub_features", (buy_ewma, sell_ewma))
-        object.__setattr__(self, "half_life", half_life)
-        object.__setattr__(self, "log", log)
-        object.__setattr__(self, "eps", eps)
-        object.__setattr__(self, "time", time)
-        object.__setattr__(self, "unit", unit)
-        self._validate_tree()
 
-    def to_config(self) -> dict[str, Any]:
-        return {
-            **super().to_config(),
-            "half_life": _json_ready_half_life(self.half_life),
-            "log": self.log,
-            "eps": self.eps,
-            "time": self.time,
-            "unit": self.unit,
-        }
+class PullMomentum(BuySellMomentum):
+    def __init__(
+        self,
+        name: str,
+        half_life: HalfLife,
+        log: bool = False,
+        eps: float = 1e-12,
+        time: str = "ts_event",
+        unit: bool = False,
+        normalized: bool = True,
+    ) -> None:
+        super().__init__(
+            name,
+            half_life,
+            mode="pull",
+            log=log,
+            eps=eps,
+            time=time,
+            unit=unit,
+            normalized=normalized,
+        )
 
 
 def _child_carryovers(carryover: Any | None) -> Mapping[str, Any]:
@@ -306,24 +464,74 @@ def _json_ready_half_life(half_life: HalfLife) -> str | int | float:
     return half_life
 
 
+def _half_life_ns(half_life: HalfLife) -> int:
+    if isinstance(half_life, bool):
+        raise TypeError(
+            "half_life must be a duration string, timedelta, or positive seconds"
+        )
+    if isinstance(half_life, Real):
+        return _seconds_ns(float(half_life))
+    if isinstance(half_life, timedelta):
+        return _seconds_ns(half_life.total_seconds())
+    if isinstance(half_life, str):
+        return _duration_str_ns(half_life)
+    raise TypeError("half_life must be a duration string, timedelta, or positive seconds")
+
+
 def _half_life(half_life: HalfLife) -> str | timedelta:
     if isinstance(half_life, bool):
         raise TypeError(
             "half_life must be a duration string, timedelta, or positive seconds"
         )
     if isinstance(half_life, Real):
-        seconds = float(half_life)
-        if not isfinite(seconds) or seconds <= 0:
-            raise ValueError("numeric half_life is in seconds and must be positive")
-        ns = round(seconds * 1_000_000_000)
-        if ns <= 0:
-            raise ValueError(
-                "numeric half_life is in seconds and must be at least 0.5ns"
-            )
-        return f"{ns}ns"
+        return f"{_seconds_ns(float(half_life))}ns"
     if isinstance(half_life, (str, timedelta)):
         return half_life
     raise TypeError("half_life must be a duration string, timedelta, or positive seconds")
+
+
+def _seconds_ns(seconds: float) -> int:
+    if not isfinite(seconds) or seconds <= 0:
+        raise ValueError("numeric half_life is in seconds and must be positive")
+    ns = round(seconds * 1_000_000_000)
+    if ns <= 0:
+        raise ValueError("numeric half_life is in seconds and must be at least 0.5ns")
+    return ns
+
+
+def _duration_str_ns(duration: str) -> int:
+    text = duration.strip()
+    if not text:
+        raise ValueError("duration string half_life must not be empty")
+    total = 0.0
+    pos = 0
+    while pos < len(text):
+        match = _DURATION_RE.match(text, pos)
+        if match is None:
+            raise ValueError(f"unsupported duration string half_life: {duration!r}")
+        value, unit = match.groups()
+        total += float(value) * _DURATION_NS[unit]
+        pos = match.end()
+    ns = round(total)
+    if ns <= 0:
+        raise ValueError("duration string half_life must be at least 0.5ns")
+    return ns
+
+
+def _check_momentum_mode(mode: str) -> str:
+    if mode not in {"trade", "push", "pull"}:
+        raise ValueError("momentum mode must be one of: 'trade', 'push', 'pull'")
+    return mode
+
+
+def _momentum_inputs(mode: str, unit: bool) -> tuple[pl.Expr, pl.Expr]:
+    if mode == "trade":
+        return _trade_side_input(0, unit), _trade_side_input(1, unit)
+    if mode == "push":
+        return _book_push_input("bid", unit), _book_push_input("ask", unit)
+    if mode == "pull":
+        return _book_pull_input("ask", unit), _book_pull_input("bid", unit)
+    raise ValueError("momentum mode must be one of: 'trade', 'push', 'pull'")
 
 
 def _trade_side_input(side: int, unit: bool) -> pl.Expr:
@@ -334,6 +542,24 @@ def _trade_side_input(side: int, unit: bool) -> pl.Expr:
         .then(pl.col("trade_sz").cast(pl.Float64))
         .otherwise(0.0)
     )
+
+
+def _book_push_input(side: str, unit: bool) -> pl.Expr:
+    return _unitize(_book_size_diff(side).clip(lower_bound=0), unit)
+
+
+def _book_pull_input(side: str, unit: bool) -> pl.Expr:
+    return _unitize((-_book_size_diff(side)).clip(lower_bound=0), unit)
+
+
+def _book_size_diff(side: str) -> pl.Expr:
+    return pl.col(f"{side}_sz_0").cast(pl.Float64).diff().fill_null(0.0)
+
+
+def _unitize(expr: pl.Expr, unit: bool) -> pl.Expr:
+    if not unit:
+        return expr
+    return pl.when(expr > 0).then(1.0).otherwise(0.0)
 
 
 def _diff(left: pl.Expr, right: pl.Expr, log: bool, eps: float) -> pl.Expr:

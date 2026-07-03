@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Callable, Any
 import numpy as np
@@ -145,4 +146,155 @@ def get_unit_pnl(threshold: float, power: int = 0) -> Score:
         return unit_pnl(y_true, y_pred, ctx, threshold, combine_with, power)
 
     score.__name__ = f"unit_pnl_{threshold:g}"
+    return score
+
+
+def quantile_pnl(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    ctx: dict[str, Any] | None = None,
+    q_buy: int = -1,
+    q_sell: int = 0,
+    thd_buy: float = 0.0,
+    thd_sell: float = 0.0,
+    combine_with: Any = _NO_COMBINE,
+    power: int = 0,
+) -> float | ScoreValue:
+    y = np.asarray(y_true, dtype=float)
+    p = np.asarray(y_pred, dtype=float)
+    if p.ndim == 1:
+        p = p[:, None]
+    if len(y) != p.shape[0]:
+        raise ValueError(
+            f"score length mismatch: y_true={len(y)}, y_pred={p.shape[0]}"
+        )
+    n_quantiles = p.shape[1]
+    if not -n_quantiles <= q_buy < n_quantiles:
+        raise ValueError(f"q_buy={q_buy} is out of bounds for {n_quantiles} columns")
+    if not -n_quantiles <= q_sell < n_quantiles:
+        raise ValueError(f"q_sell={q_sell} is out of bounds for {n_quantiles} columns")
+
+    buy = p[:, q_buy] > thd_buy
+    sell = p[:, q_sell] < thd_sell
+    overlap = buy & sell
+    buy &= ~overlap
+    sell &= ~overlap
+    active = buy | sell
+
+    side = np.zeros(len(y), dtype=float)
+    side[buy] = 1.0
+    side[sell] = -1.0
+    signal = np.where(buy, p[:, q_buy], np.where(sell, p[:, q_sell], 0.0))
+    weight = (
+        np.abs(signal[active]) ** power
+        if power != 0
+        else np.ones(int(active.sum()))
+    )
+
+    pnl = float(np.sum(side[active] * weight * y[active]))
+    n = int(active.sum())
+    norm = float(np.sum(weight)) if power != 0 else n
+    n_buy = int(buy.sum())
+    n_sell = int(sell.sum())
+    n_overlap = int(overlap.sum())
+    if combine_with is not _NO_COMBINE and combine_with is not None:
+        state = getattr(combine_with, "state", {})
+        pnl += float(state.get("pnl", 0.0))
+        n += int(getattr(combine_with, "n", 0))
+        norm += float(state.get("norm", 0.0))
+        n_buy += int(state.get("n_buy", 0))
+        n_sell += int(state.get("n_sell", 0))
+        n_overlap += int(state.get("n_overlap", 0))
+    score = pnl / norm if norm else 0.0
+    if ctx is not None:
+        ctx["n_active"] = n
+        ctx["n_buy"] = n_buy
+        ctx["n_sell"] = n_sell
+        ctx["n_overlap"] = n_overlap
+    if combine_with is _NO_COMBINE:
+        return score
+    return ScoreValue(
+        score,
+        n,
+        {
+            "pnl": pnl,
+            "norm": norm,
+            "n_buy": n_buy,
+            "n_sell": n_sell,
+            "n_overlap": n_overlap,
+        },
+    )
+
+
+def get_quantile_pnl(
+    q_buy: int,
+    q_sell: int,
+    thd_buy: float,
+    thd_sell: float,
+    power: int = 0,
+) -> Score:
+    def score(
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        ctx: dict[str, Any] | None = None,
+        combine_with: Any = _NO_COMBINE,
+    ) -> float | ScoreValue:
+        return quantile_pnl(
+            y_true,
+            y_pred,
+            ctx,
+            q_buy,
+            q_sell,
+            thd_buy,
+            thd_sell,
+            combine_with,
+            power,
+        )
+
+    score.__name__ = (
+        f"quantile_pnl_buy{q_buy}_gt{thd_buy:g}_sell{q_sell}_lt{thd_sell:g}"
+    )
+    return score
+
+
+def pinball(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    ctx: dict[str, Any] | None = None,
+    quantiles: Sequence[float] = (0.5,),
+    combine_with: Any = _NO_COMBINE,
+) -> float | ScoreValue:
+    y = np.asarray(y_true, dtype=float).reshape(-1, 1)
+    p = np.asarray(y_pred, dtype=float)
+    if p.ndim == 1:
+        p = p[:, None]
+    q = np.asarray(quantiles, dtype=float)
+    if p.shape[1] != q.size:
+        raise ValueError(
+            f"y_pred has {p.shape[1]} columns for {q.size} quantiles"
+        )
+    err = y - p
+    loss = float(np.sum(np.maximum(q * err, (q - 1.0) * err)))
+    n = int(len(y))
+    if combine_with is not _NO_COMBINE and combine_with is not None:
+        loss += float(getattr(combine_with, "state", {}).get("loss", 0.0))
+        n += int(getattr(combine_with, "n", 0))
+    score = loss / (n * q.size) if n else 0.0
+    if combine_with is _NO_COMBINE:
+        return score
+    return ScoreValue(score, n, {"loss": loss})
+
+
+def get_pinball(quantiles: Sequence[float]) -> Score:
+    q = tuple(float(x) for x in quantiles)
+
+    def score(
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        ctx: dict[str, Any] | None = None,
+        combine_with: Any = _NO_COMBINE,
+    ) -> float | ScoreValue:
+        return pinball(y_true, y_pred, ctx, q, combine_with)
+
+    score.__name__ = f"pinball_{'_'.join(f'{x:g}' for x in q)}"
     return score

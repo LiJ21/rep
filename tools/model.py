@@ -130,9 +130,14 @@ class XGBoostAdapter(BaseAdapter):
     xgb_dtype: Any | None = np.float32
     callbacks: list[Any] = field(default_factory=list)
     pruning_metric: str | None = None
+    quantiles: Sequence[float] | None = None
 
     def build(self, params: dict[str, Any]) -> dict[str, Any]:
-        return dict(params)
+        params = dict(params)
+        if self.quantiles is not None:
+            params["objective"] = "reg:quantileerror"
+            params["quantile_alpha"] = np.asarray(self.quantiles, dtype=float)
+        return params
 
     def fit(
         self,
@@ -1008,7 +1013,8 @@ class TorchAdapter(BaseAdapter):
         with torch.inference_mode():
             x = _writable_array(x, dtype=np.float32)
             xb = torch.as_tensor(x, dtype=torch.float32, device=device)
-            return model(xb).detach().cpu().numpy().reshape(-1)
+            pred = model(xb).detach().cpu().numpy()
+            return pred.reshape(-1) if pred.ndim == 2 and pred.shape[1] == 1 else pred
 
     def save_model(self, model: Any, path: str | Path) -> dict[str, Any]:
         import torch

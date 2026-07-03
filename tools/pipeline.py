@@ -325,7 +325,9 @@ class Pipeline:
         finally:
             self.tracker.finish()
 
-    def test(self, score: Score = rmse) -> dict[str, Any]:
+    def test(
+        self, score: Score = rmse, keep_predictions: bool = True
+    ) -> dict[str, Any]:
         if self.model is None:
             raise RuntimeError("call train() before test()")
         transform = self.fitted_transform or self._fit_transform(
@@ -333,7 +335,7 @@ class Pipeline:
         )
         src = self._src(self.test_dates, self.test_filters, transform, "test")
         loss, ctx, y_pred = self._evaluate(
-            self.model, src, score, "test", keep_predictions=True
+            self.model, src, score, "test", keep_predictions=keep_predictions
         )
         return {"test_score": loss, "n": int(ctx["n"]), "ctx": ctx, "y_pred": y_pred}
 
@@ -426,7 +428,9 @@ class Pipeline:
 
         transform_meta = manifest.get("transform")
         if transform_meta:
-            self.fitted_transform = load_transform(root / transform_meta["path"], transform_meta)
+            self.fitted_transform = load_transform(
+                root / transform_meta["path"], transform_meta
+            )
         model_meta = manifest.get("model")
         if model_meta:
             self.load_model(root / model_meta["path"], model_meta)
@@ -621,7 +625,9 @@ def _exprs_to_config(
     ]
 
 
-def _expr_to_config(expr: pl.Expr, registry_path: Path, base_name: str) -> dict[str, Any]:
+def _expr_to_config(
+    expr: pl.Expr, registry_path: Path, base_name: str
+) -> dict[str, Any]:
     blob = expr.meta.serialize(format="json")
     fingerprint = hashlib.sha256(blob.encode()).hexdigest()
     return {

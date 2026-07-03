@@ -131,6 +131,12 @@ class XGBoostAdapter(BaseAdapter):
     callbacks: list[Any] = field(default_factory=list)
     pruning_metric: str | None = None
     quantiles: Sequence[float] | None = None
+    fit_history: list[dict[str, Any]] = field(
+        default_factory=list, init=False, repr=False
+    )
+    last_fit_history: dict[str, Any] | None = field(
+        default=None, init=False, repr=False
+    )
 
     def build(self, params: dict[str, Any]) -> dict[str, Any]:
         params = dict(params)
@@ -157,9 +163,11 @@ class XGBoostAdapter(BaseAdapter):
         with self._cache_scope() as cache:
             dtrain: Any | None = None
             evals: list[tuple[Any, str]] = []
+            has_val = val is not None
             try:
                 dtrain = self._dmatrix(xgb, train, cache_prefix=cache.prefix("train"))
-                if val is not None:
+                evals.append((dtrain, "train"))
+                if has_val:
                     evals.append(
                         (
                             self._dmatrix(
@@ -192,7 +200,9 @@ class XGBoostAdapter(BaseAdapter):
                     num_boost_round=self.num_boost_round,
                     evals=evals,
                     evals_result=history,
-                    early_stopping_rounds=self.early_stopping_rounds if evals else None,
+                    early_stopping_rounds=(
+                        self.early_stopping_rounds if has_val else None
+                    ),
                     callbacks=callbacks,
                     verbose_eval=False,
                 )
@@ -203,8 +213,11 @@ class XGBoostAdapter(BaseAdapter):
             for metric, values in metrics.items():
                 if values:
                     tracker.log({f"xgb/{name}_{metric}": values[-1]})
+        record = self._fit_record(booster, fit_context, history)
+        self.last_fit_history = record
+        self.fit_history.append(record)
         if trial is not None:
-            self._record_trial_fit(trial, booster, fit_context)
+            self._record_trial_fit(trial, record)
         return booster
 
     def predict(self, model: Any, x: np.ndarray) -> np.ndarray:
@@ -304,10 +317,8 @@ class XGBoostAdapter(BaseAdapter):
     def _record_trial_fit(
         self,
         trial: Any,
-        booster: Any,
-        fit_context: dict[str, Any] | None,
+        record: dict[str, Any],
     ) -> None:
-        record = self._fit_record(booster, fit_context)
         records = list(trial.user_attrs.get("xgb_fits", []))
         records.append(record)
         trial.set_user_attr("xgb_fits", records)
@@ -329,23 +340,17 @@ class XGBoostAdapter(BaseAdapter):
         self,
         booster: Any,
         fit_context: dict[str, Any] | None,
+        history: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        ctx = fit_context or {}
         best_iteration = _as_optional_int(_safe_attr(booster, "best_iteration"))
         best_score = _as_optional_float(_safe_attr(booster, "best_score"))
-        record: dict[str, Any] = {
-            "role": ctx.get("role"),
-            "fold": ctx.get("fold"),
-            "train_dates": ctx.get("train_dates"),
-            "val_dates": ctx.get("val_dates"),
-            "best_iteration": best_iteration,
-            "best_num_boost_round": (
-                best_iteration + 1 if best_iteration is not None else None
-            ),
-            "best_score": best_score,
-            "num_boosted_rounds": _num_boosted_rounds(booster),
-        }
-        return record
+        return _fit_record(
+            fit_context,
+            history=_xgb_history(history) if history is not None else None,
+            best_iteration=best_iteration,
+            best_score=best_score,
+            num_boosted_rounds=_num_boosted_rounds(booster),
+        )
 
 
 def _safe_attr(obj: Any, name: str) -> Any | None:
@@ -378,6 +383,61 @@ def _num_boosted_rounds(booster: Any) -> int | None:
         return int(booster.num_boosted_rounds())
     except (AttributeError, TypeError, ValueError):
         return None
+
+
+def _fit_record(
+    fit_context: dict[str, Any] | None,
+    *,
+    history: dict[str, dict[str, list[float]]] | None = None,
+    best_iteration: int | None = None,
+    best_score: float | None = None,
+    num_boosted_rounds: int | None = None,
+) -> dict[str, Any]:
+    ctx = fit_context or {}
+    record: dict[str, Any] = {
+        "role": ctx.get("role"),
+        "fold": ctx.get("fold"),
+        "train_dates": ctx.get("train_dates"),
+        "val_dates": ctx.get("val_dates"),
+        "best_iteration": best_iteration,
+        "best_num_boost_round": (
+            best_iteration + 1 if best_iteration is not None else None
+        ),
+        "best_score": best_score,
+        "num_boosted_rounds": num_boosted_rounds,
+    }
+    if history is not None:
+        record["history"] = history
+    return record
+
+
+def _xgb_history(history: dict[str, Any]) -> dict[str, dict[str, list[float]]]:
+    return {
+        str(name): {
+            str(metric): [float(value) for value in values]
+            for metric, values in metrics.items()
+        }
+        for name, metrics in history.items()
+    }
+
+
+def _best_metric_index(metrics: dict[str, list[float]]) -> int | None:
+    values = _first_metric_values(metrics)
+    if values is None or not values:
+        return None
+    return int(np.nanargmin(np.asarray(values, dtype=float)))
+
+
+def _best_metric_value(metrics: dict[str, list[float]]) -> float | None:
+    idx = _best_metric_index(metrics)
+    values = _first_metric_values(metrics)
+    return float(values[idx]) if idx is not None and values is not None else None
+
+
+def _first_metric_values(metrics: dict[str, list[float]]) -> list[float] | None:
+    for values in metrics.values():
+        return values
+    return None
 
 
 class _XGBoostCacheScope:
@@ -953,6 +1013,12 @@ class TorchAdapter(BaseAdapter):
     device: str | None = None
     distributed: bool = False
     streaming: bool = True
+    fit_history: list[dict[str, Any]] = field(
+        default_factory=list, init=False, repr=False
+    )
+    last_fit_history: dict[str, Any] | None = field(
+        default=None, init=False, repr=False
+    )
 
     def build(self, params: dict[str, Any]) -> Any:
         model = self.module_builder(params)
@@ -980,6 +1046,9 @@ class TorchAdapter(BaseAdapter):
             model = torch.nn.parallel.DistributedDataParallel(model)
         loss_fn = self.loss_fn or torch.nn.MSELoss()
         optimizer = self._optimizer(torch, model, model_params)
+        history: dict[str, dict[str, list[float]]] = {"train": {"loss": []}}
+        if val is not None:
+            history["val"] = {"loss": []}
 
         for epoch in range(self.epochs):
             print(f"======== Torch Adapter -- Epoch {epoch}")
@@ -994,15 +1063,30 @@ class TorchAdapter(BaseAdapter):
                 optimizer.step()
                 losses.append(float(loss.detach().cpu()))
             metrics = {"torch/train_loss": float(np.mean(losses)) if losses else 0.0}
+            history["train"]["loss"].append(metrics["torch/train_loss"])
             if val is not None:
                 metrics["torch/val_loss"] = self._eval_loss(
                     torch, model, val, loss_fn, device
                 )
+                history["val"]["loss"].append(metrics["torch/val_loss"])
             print(
                 f"======== Torch Adapter -- train loss = {metrics['torch/train_loss']}"
                 + (f", val loss = {metrics['torch/val_loss']}" if val is not None else "")
             )
             tracker.log(metrics, step=epoch)
+        record = _fit_record(
+            fit_context,
+            history=history,
+            best_iteration=_best_metric_index(history.get("val", history["train"])),
+            best_score=_best_metric_value(history.get("val", history["train"])),
+            num_boosted_rounds=self.epochs,
+        )
+        self.last_fit_history = record
+        self.fit_history.append(record)
+        if trial is not None:
+            records = list(trial.user_attrs.get("torch_fits", []))
+            records.append(record)
+            trial.set_user_attr("torch_fits", records)
         return model
 
     def predict(self, model: Any, x: np.ndarray) -> np.ndarray:

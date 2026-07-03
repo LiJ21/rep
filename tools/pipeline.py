@@ -11,7 +11,7 @@ import resource
 import threading
 import time
 from contextlib import contextmanager
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -144,6 +144,298 @@ def merge_ctx(total: dict[str, Any], batch: dict[str, Any]) -> None:
             total[key] = value
 
 
+def plot_train_val_loss(
+    history: Any,
+    *,
+    trial: int | str | None = "best",
+    fold: int | str | None = None,
+    metric: str | None = None,
+    ax: Any | None = None,
+    axes: Any | None = None,
+    max_cols: int = 2,
+    title: str | None = None,
+    score_direction: str | None = None,
+) -> Any:
+    """Plot per-fit train/validation curves from Pipeline fit history.
+
+    Accepts a ``Pipeline.train()`` result, a ``save_history()`` payload, raw
+    ``pipeline.validation_history``, one validation record with ``fit_history``,
+    or one record returned by ``pipeline.refit()``. By default, validation
+    histories plot every fold from the best trial. Use ``trial=None`` to plot
+    all trials, ``fold=<n>`` to select one fold, or ``fold="best"`` to select
+    the fold with the best available fit score.
+    """
+
+    def optional_float(value: Any) -> float:
+        if value is None:
+            return np.nan
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return np.nan
+        return result if np.isfinite(result) else np.nan
+
+    def is_fit_record(value: Any) -> bool:
+        if not isinstance(value, Mapping):
+            return False
+        nested = value.get("history")
+        return isinstance(nested, Mapping) and isinstance(
+            nested.get("train"), Mapping
+        )
+
+    def sequence_value(value: Any) -> bool:
+        return isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes, bytearray)
+        )
+
+    def columnar_records(data: Mapping[str, Any]) -> list[dict[str, Any]]:
+        columns = {
+            key: list(value) if sequence_value(value) else [value]
+            for key, value in data.items()
+        }
+        n = max((len(value) for value in columns.values()), default=0)
+        return [
+            {
+                key: value[i] if i < len(value) else None
+                for key, value in columns.items()
+            }
+            for i in range(n)
+        ]
+
+    def best_record(
+        items: Sequence[dict[str, Any]], direction: str
+    ) -> dict[str, Any] | None:
+        scored = []
+        for item in items:
+            score = np.nan
+            for key in ("weighted_score", "val_score", "best_score"):
+                score = optional_float(item.get(key))
+                if np.isfinite(score):
+                    break
+            if not np.isfinite(score):
+                nested = item.get("history", {})
+                val_metrics = nested.get("val") if isinstance(nested, Mapping) else None
+                train_metrics = (
+                    nested.get("train") if isinstance(nested, Mapping) else None
+                )
+                for metrics in (val_metrics, train_metrics):
+                    if not isinstance(metrics, Mapping):
+                        continue
+                    for values in metrics.values():
+                        curve_values = np.asarray(
+                            [optional_float(value) for value in values],
+                            dtype=float,
+                        )
+                        if curve_values.size:
+                            score = float(np.nanmin(curve_values))
+                            break
+                    if np.isfinite(score):
+                        break
+            if np.isfinite(score):
+                scored.append((score, item))
+        if not scored:
+            return items[0] if items else None
+        return (max if direction == "maximize" else min)(
+            scored, key=lambda item: item[0]
+        )[1]
+
+    def best_choice(value: Any) -> bool:
+        return isinstance(value, str) and value.lower() in {"best", "optimal"}
+
+    def curve(record: dict[str, Any], split: str, metric_name: str) -> np.ndarray:
+        nested = record.get("history", {})
+        metrics = nested.get(split, {}) if isinstance(nested, Mapping) else {}
+        values = metrics.get(metric_name, []) if isinstance(metrics, Mapping) else []
+        return np.asarray([optional_float(value) for value in values], dtype=float)
+
+    meta: dict[str, Any] = {}
+    data = history
+    if is_fit_record(history):
+        records = [dict(history)]
+    else:
+        if isinstance(history, Mapping):
+            meta = dict(history)
+            data = history.get("validation_history", history.get("fit_history"))
+            if data is None:
+                has_columns = any(sequence_value(value) for value in history.values())
+                data = columnar_records(history) if has_columns else [history]
+        if is_fit_record(data):
+            records = [dict(data)]
+        else:
+            if hasattr(data, "to_dicts"):
+                data = data.to_dicts()
+            elif hasattr(data, "to_dict") and not isinstance(data, Mapping):
+                try:
+                    data = data.to_dict("records")
+                except TypeError:
+                    pass
+            if is_fit_record(data):
+                records = [dict(data)]
+            else:
+                if isinstance(data, Mapping):
+                    has_columns = any(sequence_value(value) for value in data.values())
+                    data = columnar_records(data) if has_columns else [data]
+                records = []
+                for item in data or []:
+                    if not isinstance(item, Mapping):
+                        continue
+                    if is_fit_record(item):
+                        records.append(dict(item))
+                        continue
+                    fit_history = item.get("fit_history")
+                    if not is_fit_record(fit_history):
+                        continue
+                    record = dict(fit_history)
+                    for key in (
+                        "trial",
+                        "fold",
+                        "val_score",
+                        "weighted_score",
+                        "n",
+                        "dates",
+                        "natures",
+                        "params",
+                    ):
+                        if key in item and key not in record:
+                            record[key] = item[key]
+                    records.append(record)
+
+    direction = (score_direction or meta.get("score_direction") or "minimize").lower()
+    if best_choice(trial):
+        final_by_trial: dict[Any, dict[str, Any]] = {}
+        for item in records:
+            if item.get("trial") is not None:
+                final_by_trial[item["trial"]] = item
+        best = best_record(list(final_by_trial.values()), direction)
+        chosen_trial = best.get("trial") if best is not None else None
+        if chosen_trial is not None:
+            records = [item for item in records if item.get("trial") == chosen_trial]
+    elif trial is not None:
+        records = [item for item in records if item.get("trial") == trial]
+
+    if best_choice(fold):
+        best = best_record(records, direction)
+        records = [best] if best is not None else []
+    elif fold is not None:
+        records = [item for item in records if item.get("fold") == fold]
+    if not records:
+        raise ValueError("no fit-history records match the requested filters")
+
+    try:
+        from matplotlib import pyplot as plt
+    except ImportError as exc:
+        raise ImportError("plot_train_val_loss() requires matplotlib.") from exc
+
+    if ax is not None and axes is not None:
+        raise ValueError("pass either ax or axes, not both")
+    if ax is not None:
+        if len(records) != 1:
+            raise ValueError("ax can only be used when exactly one curve is selected")
+        fig, flat_axes = ax.figure, np.asarray([ax], dtype=object)
+    elif axes is not None:
+        flat_axes = np.ravel(np.asarray(axes, dtype=object))
+        if len(flat_axes) < len(records):
+            raise ValueError(f"need at least {len(records)} axes, got {len(flat_axes)}")
+        fig = flat_axes[0].figure
+    else:
+        if max_cols < 1:
+            raise ValueError("max_cols must be positive")
+        n_cols = min(max_cols, len(records))
+        n_rows = int(np.ceil(len(records) / n_cols))
+        fig, created_axes = plt.subplots(
+            n_rows,
+            n_cols,
+            figsize=(6.0 * n_cols, 3.8 * n_rows),
+            squeeze=False,
+            constrained_layout=True,
+        )
+        flat_axes = np.ravel(created_axes)
+
+    for record, item_ax in zip(records, flat_axes):
+        nested = record.get("history", {})
+        train_metrics = nested.get("train", {}) if isinstance(nested, Mapping) else {}
+        val_metrics = nested.get("val", {}) if isinstance(nested, Mapping) else {}
+        if metric is not None:
+            metric_name = metric
+        else:
+            metric_name = None
+            for name in val_metrics:
+                if name in train_metrics:
+                    metric_name = str(name)
+                    break
+            if metric_name is None:
+                for name in train_metrics:
+                    metric_name = str(name)
+                    break
+            if metric_name is None:
+                for name in val_metrics:
+                    metric_name = str(name)
+                    break
+            if metric_name is None:
+                raise ValueError("fit history contains no train or validation metrics")
+        train = curve(record, "train", metric_name)
+        val = curve(record, "val", metric_name)
+        if not train.size and not val.size:
+            raise ValueError(f"metric {metric_name!r} has no train or val curve")
+        if train.size:
+            item_ax.plot(
+                np.arange(1, len(train) + 1),
+                train,
+                color="#2563eb",
+                linewidth=1.8,
+                label=f"train {metric_name}",
+            )
+        if val.size:
+            item_ax.plot(
+                np.arange(1, len(val) + 1),
+                val,
+                color="#dc2626",
+                linewidth=1.8,
+                label=f"val {metric_name}",
+            )
+        best_iteration = record.get("best_iteration")
+        if best_iteration is not None:
+            try:
+                item_ax.axvline(
+                    int(best_iteration) + 1,
+                    color="#f59e0b",
+                    linestyle="--",
+                    linewidth=1.0,
+                    label="best",
+                )
+            except (TypeError, ValueError):
+                pass
+
+        parts = []
+        if record.get("role") is not None:
+            parts.append(str(record["role"]))
+        if record.get("trial") is not None:
+            parts.append(f"trial {record['trial']}")
+        if record.get("fold") is not None:
+            parts.append(f"fold {record['fold']}")
+        item_title = " / ".join(parts) if parts else "fit"
+        best_score = optional_float(record.get("best_score"))
+        if np.isfinite(best_score):
+            item_title += f" | best={best_score:.6g}"
+
+        item_ax.set_title(item_title)
+        item_ax.set_xlabel("round / epoch")
+        item_ax.set_ylabel(metric_name)
+        item_ax.grid(axis="y", color="#e5e7eb", linewidth=0.8)
+        item_ax.spines["top"].set_visible(False)
+        item_ax.spines["right"].set_visible(False)
+        item_ax.legend(frameon=False)
+
+    for item_ax in flat_axes[len(records) :]:
+        item_ax.set_visible(False)
+    if title is not None:
+        fig.suptitle(title)
+    return fig
+
+
+plot_validation_history = plot_train_val_loss
+
+
 @dataclass
 class Pipeline:
     rolling_dates: list[list[str]]
@@ -173,6 +465,7 @@ class Pipeline:
     study: Any = field(default=None, init=False)
     fitted_transform: Transform | None = field(default=None, init=False)
     validation_history: list[dict[str, Any]] = field(default_factory=list, init=False)
+    refit_history: dict[str, Any] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.score_direction = self.score_direction.lower()
@@ -194,6 +487,7 @@ class Pipeline:
         verbose: int = 0,
         memory_log: bool = False,
         memory_interval: float = 0.05,
+        no_refit: bool = False,
     ) -> dict[str, Any]:
         folds = expanding_folds(self.rolling_dates)
         self.validation_history.clear()
@@ -204,6 +498,7 @@ class Pipeline:
                 "n_folds": len(folds),
                 "score_direction": self.score_direction,
                 "polars_engine": self.polars_engine,
+                "no_refit": no_refit,
             }
         )
         try:
@@ -285,6 +580,9 @@ class Pipeline:
                         "natures": ctx.get("natures"),
                         "params": params,
                     }
+                    fit_history = getattr(self.adapter, "last_fit_history", None)
+                    if fit_history is not None:
+                        record["fit_history"] = fit_history
                     if verbose > 2:
                         print("======== record = \n", record)
                     self.validation_history.append(record)
@@ -304,23 +602,35 @@ class Pipeline:
 
             self.study.optimize(objective, n_trials=self.n_trials)
             if verbose > 0:
+                action = (
+                    "Skipping final refit."
+                    if no_refit
+                    else "Refitting with best params."
+                )
                 print(
-                    "======== optimization finished, best params extracted. Refitting with best params."
+                    f"======== optimization finished, best params extracted. {action}"
                 )
             self.best_params = dict(
                 self.study.best_trial.user_attrs.get("params", self.study.best_params)
             )
-            self.model = self._refit(
-                self.best_params,
-                memory_log=memory_log,
-                memory_interval=memory_interval,
-            )
-            print("======== training done.")
+            self.model = None
+            self.fitted_transform = None
+            self.refit_history = None
+            if not no_refit:
+                self.refit(
+                    dates=self._all_train_dates(),
+                    params=self.best_params,
+                    memory_log=memory_log,
+                    memory_interval=memory_interval,
+                )
+            print("======== search done." if no_refit else "======== training done.")
             return {
                 "best_params": self.best_params,
                 "best_score": float(self.study.best_value),
                 "n_trials": len(self.study.trials),
+                "refit": not no_refit,
                 "validation_history": self.validation_history,
+                "refit_history": self.refit_history,
             }
         finally:
             self.tracker.finish()
@@ -329,7 +639,7 @@ class Pipeline:
         self, score: Score = rmse, keep_predictions: bool = True
     ) -> dict[str, Any]:
         if self.model is None:
-            raise RuntimeError("call train() before test()")
+            raise RuntimeError("call train() and refit() before test()")
         transform = self.fitted_transform or self._fit_transform(
             self._all_train_dates()
         )
@@ -422,9 +732,9 @@ class Pipeline:
         self.best_params = manifest.get("best_params")
         self.score_direction = manifest.get("score_direction", self.score_direction)
         self.polars_engine = manifest.get("polars_engine", self.polars_engine)
-        self.validation_history = list(
-            _read_json(root / "history.json").get("validation_history", [])
-        )
+        history = _read_json(root / "history.json")
+        self.validation_history = list(history.get("validation_history", []))
+        self.refit_history = history.get("refit_history")
 
         transform_meta = manifest.get("transform")
         if transform_meta:
@@ -440,15 +750,25 @@ class Pipeline:
         self.test_filters = tuple(_exprs_from_config(filters.get("test", [])))
         return manifest
 
-    def _refit(
+    def refit(
         self,
-        params: dict[str, Any],
+        dates: Sequence[str] | None = None,
+        params: dict[str, Any] | None = None,
         memory_log: bool = False,
         memory_interval: float = 0.05,
     ) -> Any:
-        train_dates = self._all_train_dates()
+        if params is None:
+            if self.best_params is None:
+                raise RuntimeError("call train() before refit() or pass params")
+            params = self.best_params
+        if dates is None:
+            train_dates = self._all_train_dates()
+        elif isinstance(dates, str):
+            train_dates = [dates]
+        else:
+            train_dates = list(dates)
         with self._memory_log(
-            f"_refit _fit_transform train_dates={train_dates}",
+            f"refit _fit_transform train_dates={train_dates}",
             enabled=memory_log,
             interval=memory_interval,
         ):
@@ -458,11 +778,11 @@ class Pipeline:
         )
         model = self.adapter.build(params)
         with self._memory_log(
-            f"_refit _fit_model train_dates={train_dates}",
+            f"refit _fit_model train_dates={train_dates}",
             enabled=memory_log,
             interval=memory_interval,
         ):
-            return self._fit_model(
+            self.model = self._fit_model(
                 model,
                 train_src,
                 None,
@@ -474,6 +794,22 @@ class Pipeline:
                     "val_dates": None,
                 },
             )
+        self.refit_history = getattr(self.adapter, "last_fit_history", None)
+        return self.refit_history
+
+    def _refit(
+        self,
+        params: dict[str, Any],
+        memory_log: bool = False,
+        memory_interval: float = 0.05,
+    ) -> Any:
+        self.refit(
+            dates=self._all_train_dates(),
+            params=params,
+            memory_log=memory_log,
+            memory_interval=memory_interval,
+        )
+        return self.model
 
     def _fit_transform(self, dates: Sequence[str]) -> Transform:
         key = (tuple(dates), self.polars_engine)
@@ -555,6 +891,7 @@ class Pipeline:
             "val_score": _callable_name(self.val_score),
             "n_trials": n_trials,
             "validation_history": self.validation_history,
+            "refit_history": self.refit_history,
         }
 
     @contextmanager

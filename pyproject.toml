@@ -10,6 +10,7 @@ dependencies = [
     "pyarrow>=15.0.0",
     "ray[data,train]>=2.55.1",
     "torch>=2.12.1",
+    "tensorboard>=2.16.0",
     "polars>=1.41.2",
     "exchange-calendars>=4.13.2",
     "optuna>=4.9.0",

@@ -148,7 +148,10 @@ def create_study(
         raise ImportError("Pipeline.train() requires optuna. Install project dependencies first.") from exc
 
     sampler_obj = _make_sampler(optuna, sampler, search_space, seed)
-    return optuna.create_study(direction=direction, sampler=sampler_obj, pruner=pruner)
+    pruner_obj = optuna.pruners.NopPruner() if pruner is None else pruner
+    return optuna.create_study(
+        direction=direction, sampler=sampler_obj, pruner=pruner_obj
+    )
 
 
 def _make_sampler(optuna: Any, sampler: str, search_space: SearchSpace | ParamFn | None, seed: int | None):

@@ -156,15 +156,18 @@ def plot_train_val_loss(
     max_cols: int = 2,
     title: str | None = None,
     score_direction: str | None = None,
+    complete_trials: bool = True,
 ) -> Any:
     """Plot per-fit train/validation curves from Pipeline fit history.
 
     Accepts a ``Pipeline.train()`` result, a ``save_history()`` payload, raw
     ``pipeline.validation_history``, one validation record with ``fit_history``,
     or one record returned by ``pipeline.refit()``. By default, validation
-    histories plot every fold from the best trial. Use ``trial=None`` to plot
-    all trials, ``fold=<n>`` to select one fold, or ``fold="best"`` to select
-    the fold with the best available fit score.
+    histories plot every fold from the best completed trial. Use ``trial=None``
+    to plot all trials, ``fold=<n>`` to select one fold, or ``fold="best"`` to
+    select the fold with the best available fit score. Pass
+    ``complete_trials=False`` to allow automatic best-trial selection from
+    pruned or otherwise incomplete trials.
     """
 
     def optional_float(value: Any) -> float:
@@ -175,6 +178,14 @@ def plot_train_val_loss(
         except (TypeError, ValueError):
             return np.nan
         return result if np.isfinite(result) else np.nan
+
+    def optional_int(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def is_fit_record(value: Any) -> bool:
         if not isinstance(value, Mapping):
@@ -243,6 +254,44 @@ def plot_train_val_loss(
     def best_choice(value: Any) -> bool:
         return isinstance(value, str) and value.lower() in {"best", "optimal"}
 
+    def same_trial(left: Any, right: Any) -> bool:
+        if left == right:
+            return True
+        left_int = optional_int(left)
+        right_int = optional_int(right)
+        if left_int is not None and right_int is not None:
+            return left_int == right_int
+        return str(left) == str(right)
+
+    def expected_folds(
+        items: Sequence[dict[str, Any]],
+        grouped: Mapping[Any, Sequence[dict[str, Any]]],
+    ) -> int | None:
+        meta_folds = optional_int(meta.get("n_folds"))
+        if meta_folds and meta_folds > 0:
+            return meta_folds
+        record_folds = [
+            value
+            for item in items
+            if (value := optional_int(item.get("n_folds"))) is not None and value > 0
+        ]
+        if record_folds:
+            return max(record_folds)
+        group_sizes = []
+        for group in grouped.values():
+            folds = {item.get("fold") for item in group if item.get("fold") is not None}
+            if folds:
+                group_sizes.append(len(folds))
+        return max(group_sizes, default=None)
+
+    def is_complete_trial(items: Sequence[dict[str, Any]], n_folds: int | None) -> bool:
+        if n_folds is None or n_folds <= 0:
+            return True
+        folds = {item.get("fold") for item in items if item.get("fold") is not None}
+        if folds:
+            return len(folds) >= n_folds
+        return len(items) >= n_folds
+
     def curve(record: dict[str, Any], split: str, metric_name: str) -> np.ndarray:
         nested = record.get("history", {})
         metrics = nested.get(split, {}) if isinstance(nested, Mapping) else {}
@@ -292,6 +341,7 @@ def plot_train_val_loss(
                         "fold",
                         "val_score",
                         "weighted_score",
+                        "n_folds",
                         "n",
                         "dates",
                         "natures",
@@ -303,16 +353,41 @@ def plot_train_val_loss(
 
     direction = (score_direction or meta.get("score_direction") or "minimize").lower()
     if best_choice(trial):
+        chosen_trial = meta.get("best_trial")
+        if chosen_trial is not None:
+            records = [
+                item for item in records if same_trial(item.get("trial"), chosen_trial)
+            ]
         final_by_trial: dict[Any, dict[str, Any]] = {}
+        grouped: dict[Any, list[dict[str, Any]]] = {}
         for item in records:
             if item.get("trial") is not None:
+                grouped.setdefault(item["trial"], []).append(item)
                 final_by_trial[item["trial"]] = item
-        best = best_record(list(final_by_trial.values()), direction)
-        chosen_trial = best.get("trial") if best is not None else None
-        if chosen_trial is not None:
-            records = [item for item in records if item.get("trial") == chosen_trial]
+        if chosen_trial is None:
+            candidates = grouped
+            if complete_trials and grouped:
+                n_folds = expected_folds(records, grouped)
+                complete = {
+                    trial_id: items
+                    for trial_id, items in grouped.items()
+                    if is_complete_trial(items, n_folds)
+                }
+                if complete:
+                    candidates = complete
+            best = best_record(
+                [final_by_trial[trial_id] for trial_id in candidates],
+                direction,
+            )
+            chosen_trial = best.get("trial") if best is not None else None
+            if chosen_trial is not None:
+                records = [
+                    item
+                    for item in records
+                    if same_trial(item.get("trial"), chosen_trial)
+                ]
     elif trial is not None:
-        records = [item for item in records if item.get("trial") == trial]
+        records = [item for item in records if same_trial(item.get("trial"), trial)]
 
     if best_choice(fold):
         best = best_record(records, direction)
@@ -460,6 +535,7 @@ class Pipeline:
     cache_arrays: bool = False
     seed: int | None = None
     polars_engine: str = "streaming"
+    refit_val_dates: list[str] | None = None
 
     model: Any = field(default=None, init=False)
     best_params: dict[str, Any] | None = field(default=None, init=False)
@@ -478,6 +554,12 @@ class Pipeline:
         self.train_filters = tuple(self.train_filters)
         self.val_filters = tuple(self.val_filters)
         self.test_filters = tuple(self.test_filters)
+        if self.refit_val_dates is not None:
+            self.refit_val_dates = (
+                [self.refit_val_dates]
+                if isinstance(self.refit_val_dates, str)
+                else list(self.refit_val_dates)
+            )
         self._transform_cache: dict[tuple[Any, ...], Transform] = {}
         self._array_cache: dict[
             tuple[Any, ...], tuple[np.ndarray, np.ndarray, dict[str, Any]]
@@ -553,9 +635,14 @@ class Pipeline:
                             trial,
                             fit_context={
                                 "role": "cv",
+                                "trial": trial.number,
                                 "fold": fold,
+                                "n_folds": len(folds),
                                 "train_dates": list(train_dates),
                                 "val_dates": list(val_dates),
+                                "val_score": self.val_score,
+                                "score_direction": self.score_direction,
+                                "score_name": _callable_name(self.val_score),
                             },
                         )
                     with self._memory_log(
@@ -574,6 +661,7 @@ class Pipeline:
                     record = {
                         "trial": trial.number,
                         "fold": fold,
+                        "n_folds": len(folds),
                         "val_score": loss,
                         "weighted_score": running,
                         "n": int(ctx["n"]),
@@ -597,7 +685,7 @@ class Pipeline:
                         step=trial.number * len(folds) + fold,
                     )
                     trial.report(running, step=fold)
-                    if trial.should_prune():
+                    if fold + 1 < len(folds) and trial.should_prune():
                         raise optuna.TrialPruned()
                 return weighted_mean(scores, sizes, self.fold_weighting)
 
@@ -620,6 +708,7 @@ class Pipeline:
             if not no_refit:
                 self.refit(
                     dates=self._all_train_dates(),
+                    val_dates=self.refit_val_dates,
                     params=self.best_params,
                     memory_log=memory_log,
                     memory_interval=memory_interval,
@@ -628,7 +717,9 @@ class Pipeline:
             return {
                 "best_params": self.best_params,
                 "best_score": float(self.study.best_value),
+                "best_trial": int(self.study.best_trial.number),
                 "n_trials": len(self.study.trials),
+                "n_folds": len(folds),
                 "refit": not no_refit,
                 "validation_history": self.validation_history,
                 "refit_history": self.refit_history,
@@ -715,6 +806,7 @@ class Pipeline:
             "sampler": self.sampler,
             "n_trials": self.n_trials,
             "polars_engine": self.polars_engine,
+            "refit_val_dates": self.refit_val_dates,
             "adapter": _object_info(self.adapter),
             "data_loader": _object_info(self.data_loader),
             "model": model_meta,
@@ -745,6 +837,7 @@ class Pipeline:
             list(x) for x in manifest.get("rolling_dates", self.rolling_dates)
         ]
         self.test_dates = list(manifest.get("test_dates", self.test_dates))
+        self.refit_val_dates = manifest.get("refit_val_dates", self.refit_val_dates)
         self.best_params = manifest.get("best_params")
         self.score_direction = manifest.get("score_direction", self.score_direction)
         self.polars_engine = manifest.get("polars_engine", self.polars_engine)
@@ -812,6 +905,7 @@ class Pipeline:
     def refit(
         self,
         dates: Sequence[str] | None = None,
+        val_dates: Sequence[str] | None = None,
         params: dict[str, Any] | None = None,
         memory_log: bool = False,
         memory_interval: float = 0.05,
@@ -826,6 +920,17 @@ class Pipeline:
             train_dates = [dates]
         else:
             train_dates = list(dates)
+        if val_dates is None:
+            final_val_dates = None
+        elif isinstance(val_dates, str):
+            final_val_dates = [val_dates]
+        else:
+            final_val_dates = list(val_dates)
+        if final_val_dates:
+            val_set = set(final_val_dates)
+            train_dates = [date for date in train_dates if date not in val_set]
+            if not train_dates:
+                raise ValueError("refit validation dates leave no training dates")
         with self._memory_log(
             f"refit _fit_transform train_dates={train_dates}",
             enabled=memory_log,
@@ -835,22 +940,36 @@ class Pipeline:
         train_src = self._src(
             train_dates, self.train_filters, self.fitted_transform, "final_train"
         )
+        val_src = (
+            self._src(
+                final_val_dates,
+                self.val_filters,
+                self.fitted_transform,
+                "final_val",
+            )
+            if final_val_dates
+            else None
+        )
         model = self.adapter.build(params)
         with self._memory_log(
-            f"refit _fit_model train_dates={train_dates}",
+            f"refit _fit_model train_dates={train_dates} val_dates={final_val_dates}",
             enabled=memory_log,
             interval=memory_interval,
         ):
             self.model = self._fit_model(
                 model,
                 train_src,
-                None,
+                val_src,
                 None,
                 fit_context={
                     "role": "refit",
+                    "trial": None,
                     "fold": None,
                     "train_dates": list(train_dates),
-                    "val_dates": None,
+                    "val_dates": list(final_val_dates) if final_val_dates else None,
+                    "val_score": self.val_score,
+                    "score_direction": self.score_direction,
+                    "score_name": _callable_name(self.val_score),
                 },
             )
         self.refit_history = getattr(self.adapter, "last_fit_history", None)
@@ -936,6 +1055,7 @@ class Pipeline:
 
     def _history_payload(self) -> dict[str, Any]:
         best_score = None
+        best_trial = None
         n_trials = 0
         if self.study is not None:
             n_trials = len(getattr(self.study, "trials", []))
@@ -943,12 +1063,19 @@ class Pipeline:
                 best_score = float(self.study.best_value)
             except (ValueError, AttributeError):
                 pass
+            try:
+                best_trial = int(self.study.best_trial.number)
+            except (ValueError, AttributeError):
+                pass
         return {
             "best_params": self.best_params,
             "best_score": best_score,
+            "best_trial": best_trial,
             "score_direction": self.score_direction,
             "val_score": _callable_name(self.val_score),
             "n_trials": n_trials,
+            "n_folds": max(0, len(self.rolling_dates) - 1),
+            "refit_val_dates": self.refit_val_dates,
             "validation_history": self.validation_history,
             "refit_history": self.refit_history,
         }

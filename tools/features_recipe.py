@@ -13,7 +13,6 @@ from typing import Any
 
 import polars as pl
 
-
 HalfLife = str | timedelta | int | float
 SELF_CARRYOVER = "__self__"
 CHILD_CARRYOVERS = "children"
@@ -34,14 +33,17 @@ _DURATION_NS = {
 __all__ = [
     "CHILD_CARRYOVERS",
     "SELF_CARRYOVER",
-    "BuySellMomentum",
+    "CarryForwardCarryover",
+    "CarryForwardFeature",
     "EwmaCarryover",
     "EwmaFeature",
     "ExprFeature",
-    "PullMomentum",
-    "PushMomentum",
-    "TradeMomentum",
 ]
+
+
+@dataclass(frozen=True)
+class CarryForwardCarryover:
+    value: float
 
 
 @dataclass(frozen=True)
@@ -57,9 +59,7 @@ class ExprFeature:
     sub_features: Sequence[Any] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self, "sub_features", _copy_sub_features(self.sub_features)
-        )
+        object.__setattr__(self, "sub_features", _copy_sub_features(self.sub_features))
         self._validate_tree()
 
     def apply(
@@ -85,9 +85,7 @@ class ExprFeature:
             "kind": "stateful_feature",
             "type": type(self).__name__,
             "expr": _expr_config(self.expr),
-            "sub_features": [
-                _feature_config(feature) for feature in self.sub_features
-            ],
+            "sub_features": [_feature_config(feature) for feature in self.sub_features],
         }
 
     def _apply_subfeatures(
@@ -123,6 +121,122 @@ class ExprFeature:
 
 
 @dataclass(frozen=True)
+class CarryForwardFeature(ExprFeature):
+    def apply(
+        self, lf: pl.LazyFrame, carryover: Any | None, front_pad: int = 0
+    ) -> pl.LazyFrame:
+        lf = self._apply_subfeatures(lf, carryover, front_pad=front_pad)
+        own_carryover = _own_carryover(carryover)
+
+        seed_col = self._col("seed")
+        input_col = self._col("input")
+        current_col = self._col("current")
+
+        lf = lf.with_columns(
+            pl.lit(False).alias(seed_col),
+            self.expr.cast(pl.Float64).alias(input_col),
+        )
+        if own_carryover is not None and front_pad > 0:
+            return self._apply_front_padded_carry(
+                lf,
+                own_carryover,
+                seed_col,
+                input_col,
+                current_col,
+                front_pad,
+            )
+        if own_carryover is not None:
+            seed = pl.DataFrame(
+                {
+                    seed_col: [True],
+                    input_col: [_carry_forward_value(own_carryover)],
+                }
+            ).lazy()
+            lf = pl.concat([seed, lf], how="diagonal_relaxed")
+
+        lf = self._with_carry_columns(lf, input_col, current_col)
+        return lf.filter(~pl.col(seed_col)) if own_carryover is not None else lf
+
+    def _apply_front_padded_carry(
+        self,
+        lf: pl.LazyFrame,
+        own_carryover: Any,
+        seed_col: str,
+        input_col: str,
+        current_col: str,
+        front_pad: int,
+    ) -> pl.LazyFrame:
+        order_col = self._col("front_order")
+        seed_idx = front_pad - 1
+        lf = lf.with_row_index(order_col)
+        active = (
+            lf.filter(pl.col(order_col) >= seed_idx)
+            .with_columns(
+                pl.when(pl.col(order_col) == seed_idx)
+                .then(True)
+                .otherwise(pl.col(seed_col))
+                .alias(seed_col),
+                pl.when(pl.col(order_col) == seed_idx)
+                .then(pl.lit(_carry_forward_value(own_carryover)))
+                .otherwise(pl.col(input_col))
+                .alias(input_col),
+            )
+            .pipe(self._with_carry_columns, input_col, current_col)
+        )
+        if front_pad <= 1:
+            return active.drop(order_col)
+
+        inactive = lf.filter(pl.col(order_col) < seed_idx).with_columns(
+            pl.lit(None, dtype=pl.Float64).alias(current_col),
+            pl.lit(None, dtype=pl.Float64).alias(self.name),
+        )
+        return (
+            pl.concat([inactive, active], how="diagonal_relaxed")
+            .sort(order_col)
+            .drop(order_col)
+        )
+
+    def get_carryover(self, df: pl.DataFrame) -> dict[str, Any] | None:
+        out: dict[str, Any] = {}
+        own = self._get_own_carryover(df)
+        if own is not None:
+            out[SELF_CARRYOVER] = own
+        children = self._get_child_carryovers(df)
+        if children:
+            out[CHILD_CARRYOVERS] = children
+        return out or None
+
+    def internal_cols(self) -> list[str]:
+        return _ordered_unique(
+            [
+                *super().internal_cols(),
+                self._col("seed"),
+                self._col("input"),
+                self._col("current"),
+            ]
+        )
+
+    def _get_own_carryover(self, df: pl.DataFrame) -> CarryForwardCarryover | None:
+        current_col = self._col("current")
+        if df.height == 0 or current_col not in df.columns:
+            return None
+        value = df.select(current_col).tail(1).item()
+        if value is None:
+            return None
+        return CarryForwardCarryover(float(value))
+
+    def _with_carry_columns(
+        self, lf: pl.LazyFrame, input_col: str, current_col: str
+    ) -> pl.LazyFrame:
+        return lf.with_columns(
+            pl.col(input_col).forward_fill().alias(current_col)
+        ).with_columns(pl.col(current_col).shift(1).alias(self.name))
+
+    def _col(self, suffix: str) -> str:
+        return f"__{self.name}_{suffix}"
+
+
+@dataclass(frozen=True)
 class EwmaFeature(ExprFeature):
     half_life: HalfLife = 1.0
     time: str = "ts_event"
@@ -136,15 +250,13 @@ class EwmaFeature(ExprFeature):
 
         seed_col = self._col("seed")
         time_col = self._col("time_ns")
+        state_time_col = self._col("state_time_ns")
         input_col = self._col("input")
 
         lf = lf.with_columns(
             pl.lit(False).alias(seed_col),
-            pl.col(self.time)
-            .cast(pl.Datetime("ns"))
-            .dt.epoch("ns")
-            .alias(time_col),
-            self.expr.cast(pl.Float64).alias(input_col),
+            pl.col(self.time).cast(pl.Datetime("ns")).dt.epoch("ns").alias(time_col),
+            self._input_expr().alias(input_col),
         )
         if own_carryover is not None and front_pad > 0:
             return self._apply_front_padded_ewm(
@@ -152,6 +264,7 @@ class EwmaFeature(ExprFeature):
                 own_carryover,
                 seed_col,
                 time_col,
+                state_time_col,
                 input_col,
                 front_pad,
             )
@@ -166,7 +279,8 @@ class EwmaFeature(ExprFeature):
             lf = pl.concat([seed, lf], how="diagonal_relaxed")
 
         lf = lf.with_columns(
-            self._ewm_expr(input_col, time_col).alias(self.name)
+            self._state_time_expr(input_col, time_col).alias(state_time_col),
+            self._output_expr(input_col, time_col).alias(self.name),
         )
         return lf.filter(~pl.col(seed_col)) if own_carryover is not None else lf
 
@@ -176,6 +290,7 @@ class EwmaFeature(ExprFeature):
         own_carryover: EwmaCarryover,
         seed_col: str,
         time_col: str,
+        state_time_col: str,
         input_col: str,
         front_pad: int,
     ) -> pl.LazyFrame:
@@ -198,7 +313,10 @@ class EwmaFeature(ExprFeature):
                 .otherwise(pl.col(input_col))
                 .alias(input_col),
             )
-            .with_columns(self._ewm_expr(input_col, time_col).alias(self.name))
+            .with_columns(
+                self._state_time_expr(input_col, time_col).alias(state_time_col),
+                self._output_expr(input_col, time_col).alias(self.name),
+            )
         )
         if front_pad <= 1:
             return active.drop(order_col)
@@ -228,6 +346,7 @@ class EwmaFeature(ExprFeature):
                 *super().internal_cols(),
                 self._col("seed"),
                 self._col("time_ns"),
+                self._col("state_time_ns"),
                 self._col("input"),
             ]
         )
@@ -241,13 +360,36 @@ class EwmaFeature(ExprFeature):
         }
 
     def _get_own_carryover(self, df: pl.DataFrame) -> EwmaCarryover | None:
-        cols = [self._col("time_ns"), self.name]
+        time_col = (
+            self._col("state_time_ns") if self.normalized else self._col("time_ns")
+        )
+        if time_col not in df.columns:
+            time_col = self._col("time_ns")
+        cols = [time_col, self.name]
         if df.height == 0 or any(col not in df.columns for col in cols):
             return None
         time_ns, value = df.select(cols).tail(1).row(0)
         if time_ns is None or value is None:
             return None
         return EwmaCarryover(int(time_ns), float(value))
+
+    def _input_expr(self) -> pl.Expr:
+        expr = self.expr.cast(pl.Float64)
+        return expr if self.normalized else expr.fill_null(0.0)
+
+    def _state_time_expr(self, input_col: str, time_col: str) -> pl.Expr:
+        if not self.normalized:
+            return pl.col(time_col)
+        return (
+            pl.when(pl.col(input_col).is_not_null())
+            .then(pl.col(time_col))
+            .otherwise(None)
+            .forward_fill()
+        )
+
+    def _output_expr(self, input_col: str, time_col: str) -> pl.Expr:
+        expr = self._ewm_expr(input_col, time_col)
+        return expr.forward_fill() if self.normalized else expr
 
     def _ewm_expr(self, input_col: str, time_col: str) -> pl.Expr:
         if self.normalized:
@@ -288,168 +430,6 @@ class EwmaFeature(ExprFeature):
         return f"__{self.name}_{suffix}"
 
 
-@dataclass(frozen=True, init=False)
-class BuySellMomentum(ExprFeature):
-    mode: str
-    half_life: HalfLife
-    log: bool
-    eps: float
-    time: str
-    unit: bool
-    normalized: bool
-
-    def __init__(
-        self,
-        name: str,
-        half_life: HalfLife,
-        mode: str = "trade",
-        log: bool = False,
-        eps: float = 1e-12,
-        time: str = "ts_event",
-        unit: bool = False,
-        normalized: bool = True,
-    ) -> None:
-        mode = _check_momentum_mode(mode)
-        buy, sell = _momentum_inputs(mode, unit)
-        child_time = time if mode == "trade" else self._col_for(name, "time_ns")
-        buy_ewma = EwmaFeature(
-            name=f"__ewma_{name}_buy",
-            expr=buy,
-            half_life=half_life,
-            time=child_time,
-            normalized=normalized,
-        )
-        sell_ewma = EwmaFeature(
-            name=f"__ewma_{name}_sell",
-            expr=sell,
-            half_life=half_life,
-            time=child_time,
-            normalized=normalized,
-        )
-        expr = _diff(pl.col(buy_ewma.name), pl.col(sell_ewma.name), log, eps)
-
-        object.__setattr__(self, "name", name)
-        object.__setattr__(self, "expr", expr)
-        object.__setattr__(self, "sub_features", (buy_ewma, sell_ewma))
-        object.__setattr__(self, "mode", mode)
-        object.__setattr__(self, "half_life", half_life)
-        object.__setattr__(self, "log", log)
-        object.__setattr__(self, "eps", eps)
-        object.__setattr__(self, "time", time)
-        object.__setattr__(self, "unit", unit)
-        object.__setattr__(self, "normalized", normalized)
-        self._validate_tree()
-
-    def apply(
-        self, lf: pl.LazyFrame, carryover: Any | None, front_pad: int = 0
-    ) -> pl.LazyFrame:
-        if self.mode == "trade":
-            return super().apply(lf, carryover, front_pad=front_pad)
-
-        time_col = self._col("time_ns")
-        lf = lf.with_columns(
-            pl.col(self.time)
-            .cast(pl.Datetime("ns"))
-            .dt.epoch("ns")
-            .alias(time_col),
-        )
-        return super().apply(lf, carryover, front_pad=front_pad)
-
-    def internal_cols(self) -> list[str]:
-        cols = super().internal_cols()
-        if self.mode != "trade":
-            cols.append(self._col("time_ns"))
-        return _ordered_unique(cols)
-
-    def to_config(self) -> dict[str, Any]:
-        return {
-            **super().to_config(),
-            "mode": self.mode,
-            "half_life": _json_ready_half_life(self.half_life),
-            "log": self.log,
-            "eps": self.eps,
-            "time": self.time,
-            "unit": self.unit,
-            "normalized": self.normalized,
-        }
-
-    def _col(self, suffix: str) -> str:
-        return self._col_for(self.name, suffix)
-
-    @staticmethod
-    def _col_for(name: str, suffix: str) -> str:
-        return f"__{name}_{suffix}"
-
-
-class TradeMomentum(BuySellMomentum):
-    def __init__(
-        self,
-        name: str,
-        half_life: HalfLife,
-        log: bool = False,
-        eps: float = 1e-12,
-        time: str = "ts_event",
-        unit: bool = False,
-        normalized: bool = True,
-    ) -> None:
-        super().__init__(
-            name,
-            half_life,
-            mode="trade",
-            log=log,
-            eps=eps,
-            time=time,
-            unit=unit,
-            normalized=normalized,
-        )
-
-
-class PushMomentum(BuySellMomentum):
-    def __init__(
-        self,
-        name: str,
-        half_life: HalfLife,
-        log: bool = False,
-        eps: float = 1e-12,
-        time: str = "ts_event",
-        unit: bool = False,
-        normalized: bool = True,
-    ) -> None:
-        super().__init__(
-            name,
-            half_life,
-            mode="push",
-            log=log,
-            eps=eps,
-            time=time,
-            unit=unit,
-            normalized=normalized,
-        )
-
-
-class PullMomentum(BuySellMomentum):
-    def __init__(
-        self,
-        name: str,
-        half_life: HalfLife,
-        log: bool = False,
-        eps: float = 1e-12,
-        time: str = "ts_event",
-        unit: bool = False,
-        normalized: bool = True,
-    ) -> None:
-        super().__init__(
-            name,
-            half_life,
-            mode="pull",
-            log=log,
-            eps=eps,
-            time=time,
-            unit=unit,
-            normalized=normalized,
-        )
-
-
 def _child_carryovers(carryover: Any | None) -> Mapping[str, Any]:
     if not isinstance(carryover, Mapping):
         return {}
@@ -467,6 +447,14 @@ def _own_carryover(carryover: Any | None) -> Any | None:
     if isinstance(carryover, Mapping):
         return carryover.get(SELF_CARRYOVER)
     return carryover
+
+
+def _carry_forward_value(carryover: Any) -> float:
+    if isinstance(carryover, CarryForwardCarryover):
+        return carryover.value
+    if isinstance(carryover, Real) and not isinstance(carryover, bool):
+        return float(carryover)
+    raise TypeError("carry-forward carryover must be CarryForwardCarryover or a number")
 
 
 def _copy_sub_features(sub_features: Sequence[Any]) -> tuple[Any, ...]:
@@ -552,7 +540,9 @@ def _half_life_ns(half_life: HalfLife) -> int:
         return _seconds_ns(half_life.total_seconds())
     if isinstance(half_life, str):
         return _duration_str_ns(half_life)
-    raise TypeError("half_life must be a duration string, timedelta, or positive seconds")
+    raise TypeError(
+        "half_life must be a duration string, timedelta, or positive seconds"
+    )
 
 
 def _half_life(half_life: HalfLife) -> str | timedelta:
@@ -564,7 +554,9 @@ def _half_life(half_life: HalfLife) -> str | timedelta:
         return f"{_seconds_ns(float(half_life))}ns"
     if isinstance(half_life, (str, timedelta)):
         return half_life
-    raise TypeError("half_life must be a duration string, timedelta, or positive seconds")
+    raise TypeError(
+        "half_life must be a duration string, timedelta, or positive seconds"
+    )
 
 
 def _seconds_ns(seconds: float) -> int:
@@ -593,51 +585,3 @@ def _duration_str_ns(duration: str) -> int:
     if ns <= 0:
         raise ValueError("duration string half_life must be at least 0.5ns")
     return ns
-
-
-def _check_momentum_mode(mode: str) -> str:
-    if mode not in {"trade", "push", "pull"}:
-        raise ValueError("momentum mode must be one of: 'trade', 'push', 'pull'")
-    return mode
-
-
-def _momentum_inputs(mode: str, unit: bool) -> tuple[pl.Expr, pl.Expr]:
-    if mode == "trade":
-        return _trade_side_input(0, unit), _trade_side_input(1, unit)
-    if mode == "push":
-        return _book_push_input("bid", unit), _book_push_input("ask", unit)
-    if mode == "pull":
-        return _book_pull_input("ask", unit), _book_pull_input("bid", unit)
-    raise ValueError("momentum mode must be one of: 'trade', 'push', 'pull'")
-
-
-def _trade_side_input(side: int, unit: bool) -> pl.Expr:
-    if unit:
-        return pl.when(pl.col("trade_side") == side).then(1.0).otherwise(0.0)
-    return (
-        pl.when(pl.col("trade_side") == side)
-        .then(pl.col("trade_sz").cast(pl.Float64))
-        .otherwise(0.0)
-    )
-
-
-def _book_push_input(side: str, unit: bool) -> pl.Expr:
-    return _unitize(_book_size_diff(side).clip(lower_bound=0), unit)
-
-
-def _book_pull_input(side: str, unit: bool) -> pl.Expr:
-    return _unitize((-_book_size_diff(side)).clip(lower_bound=0), unit)
-
-
-def _book_size_diff(side: str) -> pl.Expr:
-    return pl.col(f"{side}_sz_0").cast(pl.Float64).diff().fill_null(0.0)
-
-
-def _unitize(expr: pl.Expr, unit: bool) -> pl.Expr:
-    if not unit:
-        return expr
-    return pl.when(expr > 0).then(1.0).otherwise(0.0)
-
-
-def _diff(left: pl.Expr, right: pl.Expr, log: bool, eps: float) -> pl.Expr:
-    return (left + eps).log() - (right + eps).log() if log else left - right

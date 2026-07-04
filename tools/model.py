@@ -402,7 +402,9 @@ def _fit_record(
     ctx = fit_context or {}
     record: dict[str, Any] = {
         "role": ctx.get("role"),
+        "trial": ctx.get("trial"),
         "fold": ctx.get("fold"),
+        "n_folds": ctx.get("n_folds"),
         "train_dates": ctx.get("train_dates"),
         "val_dates": ctx.get("val_dates"),
         "best_iteration": best_iteration,
@@ -1010,6 +1012,13 @@ class _LinearStats:
 
 
 @dataclass
+class _TorchSnapshot:
+    epoch: int
+    score: float
+    state_dict: dict[str, Any]
+
+
+@dataclass
 class TorchAdapter(BaseAdapter):
     module_builder: Callable[[dict[str, Any]], Any]
     loss_fn: Any | None = None
@@ -1019,6 +1028,15 @@ class TorchAdapter(BaseAdapter):
     device: str | None = None
     distributed: bool = False
     streaming: bool = True
+    early_stopping_patience: int | None = None
+    early_stopping_min_delta: float = 0.0
+    restore_best: bool = True
+    snapshot_mode: str = "off"
+    snapshot_k: int = 1
+    snapshot_monitor: str = "val_loss"
+    snapshot_direction: str | None = None
+    snapshot_start_epoch: int = 0
+    snapshot_interval: int = 1
     fit_history: list[dict[str, Any]] = field(
         default_factory=list, init=False, repr=False
     )
@@ -1055,6 +1073,35 @@ class TorchAdapter(BaseAdapter):
         history: dict[str, dict[str, list[float]]] = {"train": {"loss": []}}
         if val is not None:
             history["val"] = {"loss": []}
+        self._check_snapshot_config()
+        monitor = self.snapshot_monitor.lower()
+        direction = self._monitor_direction(monitor, fit_context)
+        val_score = (fit_context or {}).get("val_score")
+        if val is not None and monitor == "val_score":
+            if val_score is None:
+                raise ValueError(
+                    "snapshot_monitor='val_score' requires fit_context['val_score']"
+                )
+            history.setdefault("val", {}).setdefault("score", [])
+        monitor_enabled = self._monitor_enabled(val)
+        if (
+            monitor_enabled
+            and val is None
+            and monitor in {"val_loss", "val_score"}
+        ):
+            warnings.warn(
+                "TorchAdapter early stopping/snapshots need validation data; "
+                "continuing for the configured number of epochs.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            monitor_enabled = False
+        best_epoch: int | None = None
+        best_score: float | None = None
+        best_state: dict[str, Any] | None = None
+        stopped_epoch: int | None = None
+        stale_epochs = 0
+        snapshots: list[_TorchSnapshot] = []
 
         for epoch in range(self.epochs):
             print(f"======== Torch Adapter -- Epoch {epoch}")
@@ -1075,17 +1122,85 @@ class TorchAdapter(BaseAdapter):
                     torch, model, val, loss_fn, device
                 )
                 history["val"]["loss"].append(metrics["torch/val_loss"])
+                if monitor == "val_score" and val_score is not None:
+                    score_value, _ = self._eval_score(
+                        torch,
+                        model,
+                        val,
+                        val_score,
+                        device,
+                        fold=(fit_context or {}).get("fold"),
+                    )
+                    metrics["torch/val_score"] = score_value
+                    history["val"]["score"].append(score_value)
             print(
                 f"======== Torch Adapter -- train loss = {metrics['torch/train_loss']}"
-                + (f", val loss = {metrics['torch/val_loss']}" if val is not None else "")
+                + (
+                    f", val loss = {metrics['torch/val_loss']}"
+                    if val is not None
+                    else ""
+                )
+                + (
+                    f", val score = {metrics['torch/val_score']}"
+                    if "torch/val_score" in metrics
+                    else ""
+                )
             )
-            tracker.log(metrics, step=epoch)
+            tracker.log(self._log_metrics(metrics, fit_context), step=epoch)
+            monitor_value = self._monitor_value(metrics, monitor)
+            if monitor_enabled and monitor_value is not None:
+                improved = self._is_better(
+                    monitor_value,
+                    best_score,
+                    direction,
+                    self.early_stopping_min_delta,
+                )
+                if improved:
+                    best_epoch = epoch
+                    best_score = monitor_value
+                    best_state = self._cpu_state_dict(model)
+                    stale_epochs = 0
+                else:
+                    stale_epochs += 1
+                self._maybe_snapshot(
+                    snapshots,
+                    model,
+                    epoch,
+                    monitor_value,
+                    direction,
+                )
+                if (
+                    self.early_stopping_patience is not None
+                    and not improved
+                    and stale_epochs >= self.early_stopping_patience
+                ):
+                    stopped_epoch = epoch
+                    print(
+                        "======== Torch Adapter -- early stopping at "
+                        f"epoch {epoch}; best epoch = {best_epoch}"
+                    )
+                    break
+        if self.restore_best and best_state is not None:
+            self._module(model).load_state_dict(best_state)
+        self._attach_snapshots(model, snapshots)
         record = _fit_record(
             fit_context,
             history=history,
-            best_iteration=_best_metric_index(history.get("val", history["train"])),
-            best_score=_best_metric_value(history.get("val", history["train"])),
-            num_boosted_rounds=self.epochs,
+            best_iteration=best_epoch,
+            best_score=best_score,
+            num_boosted_rounds=len(history["train"]["loss"]),
+        )
+        record.update(
+            {
+                "best_epoch": best_epoch,
+                "stopped_epoch": stopped_epoch,
+                "snapshot_mode": self.snapshot_mode,
+                "snapshot_epochs": [item.epoch for item in snapshots],
+                "snapshot_scores": [item.score for item in snapshots],
+                "monitor": monitor,
+                "monitor_direction": direction,
+                "restored_best": bool(self.restore_best and best_state is not None),
+            }
         )
         self.last_fit_history = record
         self.fit_history.append(record)
@@ -1103,8 +1218,20 @@ class TorchAdapter(BaseAdapter):
         with torch.inference_mode():
             x = _writable_array(x, dtype=np.float32)
             xb = torch.as_tensor(x, dtype=torch.float32, device=device)
-            pred = model(xb).detach().cpu().numpy()
-            return pred.reshape(-1) if pred.ndim == 2 and pred.shape[1] == 1 else pred
+            module = self._module(model)
+            snapshot_states = getattr(module, "_pipeline_snapshot_state_dicts", None)
+            mode = getattr(module, "_pipeline_snapshot_mode", "off")
+            if mode == "ensemble" and snapshot_states:
+                current = self._cpu_state_dict(model)
+                parts = []
+                try:
+                    for state in snapshot_states:
+                        module.load_state_dict(state)
+                        parts.append(self._predict_array(model, xb))
+                finally:
+                    module.load_state_dict(current)
+                return np.mean(np.stack(parts, axis=0), axis=0)
+            return self._predict_array(model, xb)
 
     def save_model(
         self, model: Any, path: str | Path, filename: str | None = None
@@ -1119,6 +1246,12 @@ class TorchAdapter(BaseAdapter):
             {
                 "params": getattr(module, "_pipeline_params", {}),
                 "state_dict": module.state_dict(),
+                "snapshot_mode": getattr(module, "_pipeline_snapshot_mode", "off"),
+                "snapshot_epochs": getattr(module, "_pipeline_snapshot_epochs", []),
+                "snapshot_scores": getattr(module, "_pipeline_snapshot_scores", []),
+                "snapshot_state_dicts": getattr(
+                    module, "_pipeline_snapshot_state_dicts", []
+                ),
             },
             artifact,
         )
@@ -1139,6 +1272,27 @@ class TorchAdapter(BaseAdapter):
         payload = torch.load(artifact, map_location=self.device or "cpu")
         model = self.build(payload.get("params", {}))
         model.load_state_dict(payload["state_dict"])
+        if payload.get("snapshot_state_dicts"):
+            setattr(
+                model,
+                "_pipeline_snapshot_mode",
+                payload.get("snapshot_mode", "off"),
+            )
+            setattr(
+                model,
+                "_pipeline_snapshot_epochs",
+                payload.get("snapshot_epochs", []),
+            )
+            setattr(
+                model,
+                "_pipeline_snapshot_scores",
+                payload.get("snapshot_scores", []),
+            )
+            setattr(
+                model,
+                "_pipeline_snapshot_state_dicts",
+                payload.get("snapshot_state_dicts", []),
+            )
         if self.device is not None:
             model = model.to(self.device)
         return model
@@ -1169,6 +1323,38 @@ class TorchAdapter(BaseAdapter):
                 losses.append(float(loss_fn(pred, yb.to(device).float()).cpu()))
         return float(np.mean(losses)) if losses else 0.0
 
+    def _eval_score(
+        self,
+        torch: Any,
+        model: Any,
+        src: "DataSource",
+        score: Callable[..., float],
+        device: Any,
+        fold: Any = None,
+    ) -> tuple[float, dict[str, Any]]:
+        from tools.pipeline import call_score, merge_ctx
+
+        state: Any = None
+        ctx: dict[str, Any] = {"n": 0}
+        model.eval()
+        with torch.inference_mode():
+            for x, y_true, batch_ctx in src.batches(self.batch_size):
+                x = _writable_array(x, dtype=np.float32)
+                xb = torch.as_tensor(x, dtype=torch.float32, device=device)
+                y_pred = self._predict_array(model, xb)
+                state = call_score(
+                    score,
+                    y_true,
+                    y_pred,
+                    dict(batch_ctx),
+                    combine_with=state,
+                )
+                merge_ctx(ctx, batch_ctx)
+        if state is None:
+            raise ValueError("cannot score empty prediction stream")
+        ctx["fold"] = fold
+        return float(state), ctx
+
     def _optimizer(self, torch: Any, model: Any, params: dict[str, Any]) -> Any:
         if self.optimizer_builder is not None:
             return self.optimizer_builder(model.parameters(), params)
@@ -1182,6 +1368,139 @@ class TorchAdapter(BaseAdapter):
         ):
             return torch.distributed.get_rank(), torch.distributed.get_world_size()
         return 0, 1
+
+    def _check_snapshot_config(self) -> None:
+        mode = self.snapshot_mode.lower()
+        if mode not in {"off", "best", "top_k", "ensemble"}:
+            raise ValueError("snapshot_mode must be one of: off, best, top_k, ensemble")
+        self.snapshot_mode = mode
+        self.snapshot_monitor = self.snapshot_monitor.lower()
+        if self.snapshot_monitor not in {"train_loss", "val_loss", "val_score"}:
+            raise ValueError(
+                "snapshot_monitor must be one of: train_loss, val_loss, val_score"
+            )
+        if self.snapshot_k < 1:
+            raise ValueError("snapshot_k must be positive")
+        if self.snapshot_start_epoch < 0:
+            raise ValueError("snapshot_start_epoch must be nonnegative")
+        if self.snapshot_interval < 1:
+            raise ValueError("snapshot_interval must be positive")
+        if (
+            self.early_stopping_patience is not None
+            and self.early_stopping_patience < 0
+        ):
+            raise ValueError("early_stopping_patience must be nonnegative")
+
+    def _monitor_enabled(self, val: "DataSource | None") -> bool:
+        return self.early_stopping_patience is not None or self.snapshot_mode != "off"
+
+    def _log_metrics(
+        self, metrics: dict[str, float], fit_context: dict[str, Any] | None
+    ) -> dict[str, float]:
+        prefix = self._metric_prefix(fit_context)
+        if prefix is None:
+            return metrics
+        out: dict[str, float] = {}
+        for key, value in metrics.items():
+            name = key.removeprefix("torch/")
+            out[f"{prefix}/{name}"] = value
+        return out
+
+    def _metric_prefix(self, fit_context: dict[str, Any] | None) -> str | None:
+        if not fit_context:
+            return None
+        role = fit_context.get("role")
+        if role == "cv":
+            trial = fit_context.get("trial")
+            fold = fit_context.get("fold")
+            if trial is None or fold is None:
+                return "torch/cv"
+            return f"torch/cv/trial_{int(trial):03d}/fold_{int(fold):02d}"
+        if role:
+            return f"torch/{role}"
+        return None
+
+    def _monitor_direction(
+        self, monitor: str, fit_context: dict[str, Any] | None
+    ) -> str:
+        direction = self.snapshot_direction
+        if direction is None and monitor == "val_score":
+            direction = (fit_context or {}).get("score_direction")
+        direction = (direction or "minimize").lower()
+        if direction not in {"minimize", "maximize"}:
+            raise ValueError("snapshot_direction must be 'minimize' or 'maximize'")
+        return direction
+
+    def _monitor_value(self, metrics: dict[str, float], monitor: str) -> float | None:
+        return metrics.get(f"torch/{monitor}")
+
+    def _is_better(
+        self,
+        value: float,
+        best: float | None,
+        direction: str,
+        min_delta: float,
+    ) -> bool:
+        if best is None:
+            return True
+        if direction == "maximize":
+            return value > best + min_delta
+        return value < best - min_delta
+
+    def _maybe_snapshot(
+        self,
+        snapshots: list[_TorchSnapshot],
+        model: Any,
+        epoch: int,
+        score: float,
+        direction: str,
+    ) -> None:
+        if self.snapshot_mode == "off":
+            return
+        if epoch < self.snapshot_start_epoch:
+            return
+        if (epoch - self.snapshot_start_epoch) % self.snapshot_interval != 0:
+            return
+        limit = 1 if self.snapshot_mode == "best" else self.snapshot_k
+        snapshots.append(_TorchSnapshot(epoch, score, self._cpu_state_dict(model)))
+        reverse = direction == "maximize"
+        snapshots.sort(key=lambda item: item.score, reverse=reverse)
+        del snapshots[limit:]
+
+    def _attach_snapshots(
+        self, model: Any, snapshots: Sequence[_TorchSnapshot]
+    ) -> None:
+        module = self._module(model)
+        setattr(module, "_pipeline_snapshot_mode", self.snapshot_mode)
+        setattr(
+            module,
+            "_pipeline_snapshot_epochs",
+            [item.epoch for item in snapshots],
+        )
+        setattr(
+            module,
+            "_pipeline_snapshot_scores",
+            [item.score for item in snapshots],
+        )
+        setattr(
+            module,
+            "_pipeline_snapshot_state_dicts",
+            [item.state_dict for item in snapshots],
+        )
+
+    def _cpu_state_dict(self, model: Any) -> dict[str, Any]:
+        module = self._module(model)
+        return {
+            name: value.detach().cpu().clone()
+            for name, value in module.state_dict().items()
+        }
+
+    def _module(self, model: Any) -> Any:
+        return model.module if hasattr(model, "module") else model
+
+    def _predict_array(self, model: Any, xb: Any) -> np.ndarray:
+        pred = model(xb).detach().cpu().numpy()
+        return pred.reshape(-1) if pred.ndim == 2 and pred.shape[1] == 1 else pred
 
 
 def _writable_array(x: Any, dtype: Any | None = None) -> np.ndarray:

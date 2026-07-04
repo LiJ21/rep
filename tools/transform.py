@@ -164,7 +164,6 @@ class Chain:
 def save_transform(
     transform: Transform,
     path: str | Path,
-    registry_path: str | Path | None = None,
     name: str | None = None,
 ) -> dict[str, Any]:
     path = Path(path)
@@ -174,11 +173,8 @@ def save_transform(
     artifact_hash = _sha256_file(path)
     config = transform_to_config(transform)
     fingerprint = _fingerprint(config) if config is not None else artifact_hash
-    base = name or _transform_name(transform)
-    versioned = _register_name(registry_path, base, fingerprint) if registry_path else base
     return {
-        "name": versioned,
-        "base_name": base,
+        "base_name": name or _transform_name(transform),
         "path": path.name,
         "format": "pickle",
         "sha256": artifact_hash,
@@ -237,30 +233,6 @@ def _transform_name(transform: Transform) -> str:
     return _snake(type(transform).__name__)
 
 
-def _register_name(path: str | Path | None, base: str, fingerprint: str) -> str:
-    if path is None:
-        return base
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    registry = _read_json(path, {})
-    if registry.get(base) == fingerprint:
-        return base
-    if base not in registry:
-        registry[base] = fingerprint
-        _write_json(path, registry)
-        return base
-    n = 2
-    while True:
-        name = f"{base}_v{n}"
-        if registry.get(name) == fingerprint:
-            return name
-        if name not in registry:
-            registry[name] = fingerprint
-            _write_json(path, registry)
-            return name
-        n += 1
-
-
 def _fingerprint(config: dict[str, Any]) -> str:
     blob = json.dumps(_json_ready(config), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode()).hexdigest()
@@ -281,21 +253,6 @@ def _pickle_dump(obj: Any, f: Any) -> None:
         pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
     else:
         cloudpickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-
-def _read_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    with path.open() as f:
-        return json.load(f)
-
-
-def _write_json(path: Path, obj: Any) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w") as f:
-        json.dump(_json_ready(obj), f, indent=2, sort_keys=True)
-        f.write("\n")
-    tmp.replace(path)
 
 
 def _json_ready(value: Any) -> Any:

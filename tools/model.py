@@ -43,7 +43,9 @@ class ModelAdapter(Protocol):
         keep_predictions: bool = False,
     ) -> tuple[float, dict[str, Any], np.ndarray | None]: ...
 
-    def save_model(self, model: Any, path: str | Path) -> dict[str, Any]: ...
+    def save_model(
+        self, model: Any, path: str | Path, filename: str | None = None
+    ) -> dict[str, Any]: ...
 
     def load_model(
         self, path: str | Path, meta: dict[str, Any] | None = None
@@ -51,10 +53,12 @@ class ModelAdapter(Protocol):
 
 
 class BaseAdapter:
-    def save_model(self, model: Any, path: str | Path) -> dict[str, Any]:
+    def save_model(
+        self, model: Any, path: str | Path, filename: str | None = None
+    ) -> dict[str, Any]:
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
-        artifact = path / "model.pkl"
+        artifact = path / f"{filename or 'model'}.pkl"
         with artifact.open("wb") as f:
             pickle.dump(model, f, protocol=pickle.HIGHEST_PROTOCOL)
         return {
@@ -223,10 +227,12 @@ class XGBoostAdapter(BaseAdapter):
     def predict(self, model: Any, x: np.ndarray) -> np.ndarray:
         return np.asarray(model.inplace_predict(x))
 
-    def save_model(self, model: Any, path: str | Path) -> dict[str, Any]:
+    def save_model(
+        self, model: Any, path: str | Path, filename: str | None = None
+    ) -> dict[str, Any]:
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
-        artifact = path / "model.ubj"
+        artifact = path / f"{filename or 'model'}.ubj"
         model.save_model(str(artifact))
         return {
             "format": "xgboost_ubj",
@@ -1100,12 +1106,14 @@ class TorchAdapter(BaseAdapter):
             pred = model(xb).detach().cpu().numpy()
             return pred.reshape(-1) if pred.ndim == 2 and pred.shape[1] == 1 else pred
 
-    def save_model(self, model: Any, path: str | Path) -> dict[str, Any]:
+    def save_model(
+        self, model: Any, path: str | Path, filename: str | None = None
+    ) -> dict[str, Any]:
         import torch
 
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
-        artifact = path / "model.pt"
+        artifact = path / f"{filename or 'model'}.pt"
         module = model.module if hasattr(model, "module") else model
         torch.save(
             {

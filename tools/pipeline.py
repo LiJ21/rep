@@ -20,6 +20,7 @@ import numpy as np
 import polars as pl
 
 from tools.data import POLARS_ENGINES, DataSource, Loader
+from tools.registry import Registry
 from tools.search import (
     BySizeRecency,
     ParamFn,
@@ -652,10 +653,12 @@ class Pipeline:
     def get_model(self) -> Any:
         return self.model
 
-    def save_model(self, path: str | Path) -> dict[str, Any]:
+    def save_model(
+        self, path: str | Path, filename: str | None = None
+    ) -> dict[str, Any]:
         if self.model is None:
             raise RuntimeError("call train() before save_model()")
-        return self.adapter.save_model(self.model, path)
+        return self.adapter.save_model(self.model, path, filename=filename)
 
     def load_model(
         self,
@@ -674,34 +677,36 @@ class Pipeline:
         if self.model is None:
             raise RuntimeError("call train() before save_pipeline()")
         root = Path(path)
-        registry_dir = root / "registries"
         root.mkdir(parents=True, exist_ok=True)
-        registry_dir.mkdir(exist_ok=True)
+        run_hash, stamp, run_dir = self._new_run_dir(root)
+        registry = Registry(root / "registry.jsonl")
 
-        model_meta = self.save_model(root / "model")
-        model_meta["path"] = "model"
-        transform_meta = save_transform(
-            self.fitted_transform or self.transform,
-            root / "transform.pkl",
-            registry_dir / "transforms.json",
-        )
-        self.save_history(root / "history.json")
+        model_meta = self.save_model(root / "model", filename=f"model_{run_hash}")
+        model_meta["path"] = f"model/{model_meta['artifact']}"
+
+        transform_path = root / "transform" / f"transform_{run_hash}.pkl"
+        transform_meta = save_transform(self.fitted_transform or self.transform, transform_path)
+        transform_meta["path"] = f"transform/{transform_path.name}"
+
+        self.save_history(run_dir / "history.json")
+
         filters = {
-            "train": _exprs_to_config(
-                self.train_filters, registry_dir / "filters.json", "train_filter"
-            ),
-            "val": _exprs_to_config(
-                self.val_filters, registry_dir / "filters.json", "val_filter"
-            ),
-            "test": _exprs_to_config(
-                self.test_filters, registry_dir / "filters.json", "test_filter"
-            ),
+            role: self._register_filters(registry, exprs, f"{role}_filter", run_hash)
+            for role, exprs in (
+                ("train", self.train_filters),
+                ("val", self.val_filters),
+                ("test", self.test_filters),
+            )
         }
+        features = self._register_features(registry, run_hash)
+
         manifest = {
-            "version": 1,
+            "version": 2,
             "created_at": dt.datetime.now(dt.UTC).isoformat(),
+            "run": {"stamp": stamp, "hash": run_hash},
             "target": self.target,
             "features": list(self.features),
+            "feature_registry": features,
             "rolling_dates": self.rolling_dates,
             "test_dates": self.test_dates,
             "best_params": self.best_params,
@@ -715,14 +720,25 @@ class Pipeline:
             "model": model_meta,
             "transform": transform_meta,
             "filters": filters,
+            "registry": {"path": "registry.jsonl"},
             "history": {"path": "history.json"},
         }
-        _write_json(root / "pipeline.json", manifest)
+        _write_json(run_dir / "pipeline.json", manifest)
         return manifest
 
     def load_pipeline(self, path: str | Path) -> dict[str, Any]:
-        root = Path(path)
-        manifest = _read_json(root / "pipeline.json")
+        run_dir = Path(path)
+        if not (run_dir / "pipeline.json").exists():
+            candidates = sorted(
+                p for p in run_dir.glob("pipeline_*") if (p / "pipeline.json").exists()
+            )
+            if not candidates:
+                raise FileNotFoundError(f"no pipeline manifest found under {run_dir}")
+            run_dir = candidates[-1]
+        manifest = _read_json(run_dir / "pipeline.json")
+        run_info = manifest.get("run")
+        root = run_dir.parent if run_info is not None else run_dir
+
         self.target = manifest.get("target", self.target)
         self.features = list(manifest.get("features", self.features))
         self.rolling_dates = [
@@ -732,7 +748,9 @@ class Pipeline:
         self.best_params = manifest.get("best_params")
         self.score_direction = manifest.get("score_direction", self.score_direction)
         self.polars_engine = manifest.get("polars_engine", self.polars_engine)
-        history = _read_json(root / "history.json")
+
+        history_path = manifest.get("history", {}).get("path", "history.json")
+        history = _read_json(run_dir / history_path, {})
         self.validation_history = list(history.get("validation_history", []))
         self.refit_history = history.get("refit_history")
 
@@ -744,11 +762,52 @@ class Pipeline:
         model_meta = manifest.get("model")
         if model_meta:
             self.load_model(root / model_meta["path"], model_meta)
+
+        registry_meta = manifest.get("registry")
+        registry = Registry(root / registry_meta["path"]) if registry_meta else None
         filters = manifest.get("filters", {})
-        self.train_filters = tuple(_exprs_from_config(filters.get("train", [])))
-        self.val_filters = tuple(_exprs_from_config(filters.get("val", [])))
-        self.test_filters = tuple(_exprs_from_config(filters.get("test", [])))
+        self.train_filters = tuple(_exprs_from_refs(filters.get("train", []), registry))
+        self.val_filters = tuple(_exprs_from_refs(filters.get("val", []), registry))
+        self.test_filters = tuple(_exprs_from_refs(filters.get("test", []), registry))
         return manifest
+
+    def _new_run_dir(self, root: Path) -> tuple[str, str, Path]:
+        while True:
+            now = dt.datetime.now(dt.UTC)
+            run_hash = hashlib.sha256(
+                now.isoformat(timespec="milliseconds").encode()
+            ).hexdigest()[:8]
+            stamp = now.strftime("%Y%m%dT%H%M")
+            run_dir = root / f"pipeline_{stamp}_{run_hash}"
+            try:
+                run_dir.mkdir(parents=True)
+            except FileExistsError:
+                continue
+            return run_hash, stamp, run_dir
+
+    def _register_filters(
+        self,
+        registry: Registry,
+        exprs: Sequence[pl.Expr],
+        prefix: str,
+        run_hash: str,
+    ) -> list[dict[str, Any]]:
+        return [
+            _register_expr(registry, "filter", f"{prefix}_{i}", expr, run_hash)
+            for i, expr in enumerate(exprs)
+        ]
+
+    def _register_features(
+        self, registry: Registry, run_hash: str
+    ) -> dict[str, dict[str, Any]]:
+        exprs = _feature_exprs(self.data_loader)
+        refs: dict[str, dict[str, Any]] = {}
+        for name in self.features:
+            expr = exprs.get(name)
+            if expr is None:
+                continue
+            refs[name] = _register_expr(registry, "feature", name, expr, run_hash)
+        return refs
 
     def refit(
         self,
@@ -951,60 +1010,66 @@ def _gb(n_bytes: int) -> float:
     return n_bytes / 1024**3
 
 
-def _exprs_to_config(
-    exprs: Sequence[pl.Expr],
-    registry_path: Path,
-    prefix: str,
-) -> list[dict[str, Any]]:
-    return [
-        _expr_to_config(expr, registry_path, f"{prefix}_{i}")
-        for i, expr in enumerate(exprs)
-    ]
-
-
-def _expr_to_config(
-    expr: pl.Expr, registry_path: Path, base_name: str
+def _register_expr(
+    registry: Registry, kind: str, name: str, expr: pl.Expr, run_hash: str
 ) -> dict[str, Any]:
     blob = expr.meta.serialize(format="json")
     fingerprint = hashlib.sha256(blob.encode()).hexdigest()
-    return {
-        "name": _register_name(registry_path, base_name, fingerprint),
-        "base_name": base_name,
-        "kind": "polars_expr",
-        "format": "json",
-        "polars_version": pl.__version__,
-        "expr": blob,
-        "repr": str(expr),
-        "roots": expr.meta.root_names(),
-        "fingerprint": fingerprint,
-    }
+    entry = registry.register(
+        kind,
+        name,
+        fingerprint,
+        {
+            "expr": blob,
+            "repr": str(expr),
+            "roots": expr.meta.root_names(),
+            "format": "json",
+            "polars_version": pl.__version__,
+        },
+        run=run_hash,
+    )
+    return {"name": name, "version": entry["version"], "fingerprint": fingerprint}
 
 
-def _exprs_from_config(configs: Sequence[dict[str, Any]]) -> list[pl.Expr]:
-    return [
-        pl.Expr.deserialize(io.StringIO(cfg["expr"]), format=cfg.get("format", "json"))
-        for cfg in configs
-    ]
+def _exprs_from_refs(
+    configs: Sequence[dict[str, Any]], registry: Registry | None
+) -> list[pl.Expr]:
+    exprs = []
+    for cfg in configs:
+        if "expr" in cfg:
+            exprs.append(
+                pl.Expr.deserialize(
+                    io.StringIO(cfg["expr"]), format=cfg.get("format", "json")
+                )
+            )
+            continue
+        if registry is None:
+            raise RuntimeError(
+                f"cannot resolve filter {cfg.get('name')!r}: no registry available"
+            )
+        entry = registry.resolve("filter", cfg["name"], cfg["version"])
+        if entry["fingerprint"] != cfg.get("fingerprint", entry["fingerprint"]):
+            raise ValueError(
+                f"registry fingerprint mismatch for filter {cfg['name']!r} "
+                f"v{cfg['version']}"
+            )
+        exprs.append(
+            pl.Expr.deserialize(
+                io.StringIO(entry["expr"]), format=entry.get("format", "json")
+            )
+        )
+    return exprs
 
 
-def _register_name(path: Path, base: str, fingerprint: str) -> str:
-    registry = _read_json(path, {}) if path.exists() else {}
-    if registry.get(base) == fingerprint:
-        return base
-    if base not in registry:
-        registry[base] = fingerprint
-        _write_json(path, registry)
-        return base
-    n = 2
-    while True:
-        name = f"{base}_v{n}"
-        if registry.get(name) == fingerprint:
-            return name
-        if name not in registry:
-            registry[name] = fingerprint
-            _write_json(path, registry)
-            return name
-        n += 1
+def _feature_exprs(loader: Any) -> Mapping[str, pl.Expr]:
+    seen: set[int] = set()
+    while loader is not None and id(loader) not in seen:
+        seen.add(id(loader))
+        exprs = getattr(loader, "feature_exprs", None)
+        if exprs:
+            return exprs
+        loader = getattr(loader, "loader", None)
+    return {}
 
 
 def _read_json(path: Path, default: Any | None = None) -> Any:

@@ -13,6 +13,8 @@ from typing import Any
 
 import polars as pl
 
+from tools.feature_plugin import ewma_unnormalized
+
 HalfLife = str | timedelta | int | float
 SELF_CARRYOVER = "__self__"
 CHILD_CARRYOVERS = "children"
@@ -403,6 +405,14 @@ class EwmaFeature(ExprFeature):
         )
 
     def _unnormalized_ewm_expr(self, input_col: str, time_col: str) -> pl.Expr:
+        rust_expr = ewma_unnormalized(
+            pl.col(input_col),
+            pl.col(time_col),
+            float(_half_life_ns(self.half_life)),
+        )
+        if rust_expr is not None:
+            return rust_expr
+
         input_expr = pl.col(input_col)
         time_expr = pl.col(time_col)
         previous_time = time_expr.shift(1)

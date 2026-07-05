@@ -135,6 +135,17 @@ def _drop_cols(df: pl.DataFrame, cols: Sequence[str]) -> pl.DataFrame:
     return df.drop(existing) if existing else df
 
 
+def _hstack_unique(frames: Sequence[pl.DataFrame]) -> pl.DataFrame:
+    if not frames:
+        return pl.DataFrame()
+    out = frames[0]
+    for frame in frames[1:]:
+        cols = [col for col in frame.columns if col not in out.columns]
+        if cols:
+            out = out.hstack(frame.select(cols))
+    return out
+
+
 def _ctx_from_df(df: pl.DataFrame) -> dict[str, Any]:
     ctx = {"n": df.height}
     for col in CTX_COLS:
@@ -225,8 +236,13 @@ class DataSource:
             self.cache[self.cache_key] = batch
         return batch
 
-    def batches(self, batch_size: int | None = None) -> Iterator[Batch]:
+    def batches(
+        self, batch_size: int | None = None, multicollect: int = -1
+    ) -> Iterator[Batch]:
         from tqdm import tqdm
+
+        if multicollect == 0:
+            raise ValueError("multicollect must be positive, or negative to disable")
 
         hint = (
             LoadHint(batch_size, self.polars_engine)
@@ -237,28 +253,116 @@ class DataSource:
             for item in self.iter_date_frames(hint):
                 internal_cols = _stateful_internal_cols(item.stateful_features)
                 cols = [*self.features, self.target, *CTX_COLS, *internal_cols]
-                lf = self._prepare(item, cols=cols)
+                if multicollect < 0:
+                    lf = self._prepare(item, cols=cols)
+                    if batch_size is None:
+                        df = lf.collect(engine=self.polars_engine)
+                        if hint is not None:
+                            hint.state.update(item.stateful_features, df)
+                        df = _drop_cols(df, internal_cols)
+                        batch = _to_batch(df, self.features, self.target)
+                        bar.update(batch[2]["n"])
+                        yield batch
+                        continue
+                    for df in lf.collect_batches(
+                        chunk_size=batch_size,
+                        maintain_order=True,
+                        engine=self.polars_engine,
+                    ):
+                        if hint is not None:
+                            hint.state.update(item.stateful_features, df)
+                        batch = _to_batch(
+                            _drop_cols(df, internal_cols), self.features, self.target
+                        )
+                        bar.update(batch[2]["n"])
+                        yield batch
+                    continue
+
+                target_cols = [self.target, *CTX_COLS]
+                feature_groups = [
+                    self.features[i : i + multicollect]
+                    for i in range(0, len(self.features), multicollect)
+                ]
+                stateful_by_name = {
+                    feature.name: feature for feature in item.stateful_features
+                }
+                group_stateful_features = [
+                    tuple(
+                        stateful_by_name[name]
+                        for name in group
+                        if name in stateful_by_name
+                    )
+                    for group in feature_groups
+                ]
+                group_internal_cols = [
+                    _stateful_internal_cols(features)
+                    for features in group_stateful_features
+                ]
+                base_lf = self._prepare(item, select=False)
+                target_lf = base_lf.select(_ordered_unique(target_cols))
+                feature_lfs = [
+                    base_lf.select(_ordered_unique([*group, *cols]))
+                    for group, cols in zip(feature_groups, group_internal_cols)
+                ]
                 if batch_size is None:
-                    df = lf.collect(engine=self.polars_engine)
-                    if hint is not None:
-                        hint.state.update(item.stateful_features, df)
-                    df = _drop_cols(df, internal_cols)
+                    df = target_lf.collect(engine=self.polars_engine)
+                    for group, features, lf in zip(
+                        feature_groups,
+                        group_stateful_features,
+                        feature_lfs,
+                    ):
+                        feature_df = lf.collect(engine=self.polars_engine)
+                        if hint is not None:
+                            hint.state.update(features, feature_df)
+                        df = _hstack_unique([df, feature_df.select(group)])
                     batch = _to_batch(df, self.features, self.target)
                     bar.update(batch[2]["n"])
                     yield batch
                     continue
-                for df in lf.collect_batches(
+
+                feature_iters = [
+                    lf.collect_batches(
+                        chunk_size=batch_size,
+                        maintain_order=True,
+                        engine=self.polars_engine,
+                    )
+                    for lf in feature_lfs
+                ]
+                for df in target_lf.collect_batches(
                     chunk_size=batch_size,
                     maintain_order=True,
                     engine=self.polars_engine,
                 ):
-                    if hint is not None:
-                        hint.state.update(item.stateful_features, df)
-                    batch = _to_batch(
-                        _drop_cols(df, internal_cols), self.features, self.target
-                    )
+                    for group, features, it in zip(
+                        feature_groups,
+                        group_stateful_features,
+                        feature_iters,
+                    ):
+                        try:
+                            feature_df = next(it)
+                        except StopIteration as exc:
+                            raise RuntimeError(
+                                "multicollect feature stream ended before target stream"
+                            ) from exc
+                        if feature_df.height != df.height:
+                            raise RuntimeError(
+                                "multicollect feature and target batches have "
+                                f"different heights: {feature_df.height} != {df.height}"
+                            )
+                        if hint is not None:
+                            hint.state.update(features, feature_df)
+                        df = _hstack_unique([df, feature_df.select(group)])
+                    batch = _to_batch(df, self.features, self.target)
                     bar.update(batch[2]["n"])
                     yield batch
+                for it in feature_iters:
+                    try:
+                        next(it)
+                    except StopIteration:
+                        continue
+                    raise RuntimeError(
+                        "multicollect feature stream produced more batches than target stream"
+                    )
 
     def labels(self) -> tuple[np.ndarray, dict[str, Any]]:
         parts = []

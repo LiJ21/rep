@@ -1,7 +1,10 @@
 use std::env;
 use std::io;
 
-use orderbook_rs::{read_rows_ipc, read_rows_parquet, write_depth_ipc, write_depth_parquet, Stats};
+use arrow_schema::ArrowError;
+use orderbook_rs::{
+    read_rows_ipc, read_rows_parquet, write_depth_ipc, write_depth_parquet, Row, Stats,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
@@ -9,10 +12,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
     let format = value(&args, "--format").unwrap_or_else(|| "parquet".to_string());
-    let rows = if has(&args, "--input-ipc") {
-        read_rows_ipc(io::stdin().lock())?
+    let rows: Box<dyn Iterator<Item = Result<Row, ArrowError>>> = if has(&args, "--input-ipc") {
+        Box::new(read_rows_ipc(io::stdin().lock())?)
     } else {
-        read_rows_parquet(input_path(&args).ok_or("missing input parquet path")?)?
+        Box::new(read_rows_parquet(
+            input_path(&args).ok_or("missing input parquet path")?,
+        )?)
     };
 
     let stats = match format.as_str() {

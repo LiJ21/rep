@@ -212,7 +212,9 @@ pub fn depth_schema(levels: usize) -> Arc<Schema> {
     Arc::new(schema(levels))
 }
 
-pub fn read_rows_parquet(path: &str) -> Result<Vec<Row>, Box<dyn std::error::Error>> {
+pub fn read_rows_parquet(
+    path: &str,
+) -> Result<impl Iterator<Item = Result<Row, ArrowError>>, Box<dyn std::error::Error>> {
     const COLS: &[&str] = &[
         "ts_event",
         "sequence",
@@ -228,53 +230,95 @@ pub fn read_rows_parquet(path: &str) -> Result<Vec<Row>, Box<dyn std::error::Err
     ];
     let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?;
     let mask = ProjectionMask::columns(builder.parquet_schema(), COLS.iter().copied());
-    rows_from_batches(
-        builder
-            .with_projection(mask)
-            .with_batch_size(262_144)
-            .build()?,
-    )
+    let reader = builder
+        .with_projection(mask)
+        .with_batch_size(262_144)
+        .build()?;
+    Ok(RowStream::new(reader))
 }
 
-pub fn read_rows_ipc<R: Read>(reader: R) -> Result<Vec<Row>, Box<dyn std::error::Error>> {
-    rows_from_batches(StreamReader::try_new(reader, None)?)
+pub fn read_rows_ipc<R: Read>(
+    reader: R,
+) -> Result<impl Iterator<Item = Result<Row, ArrowError>>, Box<dyn std::error::Error>> {
+    Ok(RowStream::new(StreamReader::try_new(reader, None)?))
 }
 
-fn rows_from_batches<I>(batches: I) -> Result<Vec<Row>, Box<dyn std::error::Error>>
-where
-    I: IntoIterator<Item = Result<RecordBatch, ArrowError>>,
-{
-    let mut rows = Vec::new();
-    let mut row_nr = 0_u64;
-    for batch in batches {
-        let batch = batch?;
-        let c = InCols::new(&batch)?;
-        for i in 0..batch.num_rows() {
-            rows.push(Row {
-                ts_event: timestamp_ns_at(c.ts_event, i)?,
-                row_nr,
-                sequence: c.sequence.value(i),
-                publisher_id: c.publisher_id.value(i),
-                instrument_id: c.instrument_id.value(i),
-                channel_id: c.channel_id.value(i),
-                action: byte_at(c.action, i)?,
-                side: byte_at(c.side, i)?,
-                price: c.price.value(i),
-                size: c.size.value(i),
-                order_id: c.order_id.value(i),
-                flags: c.flags.value(i),
-            });
-            row_nr += 1;
+/// Streams rows batch-by-batch so a full day never has to be materialized.
+pub struct RowStream<I> {
+    batches: I,
+    buf: std::vec::IntoIter<Row>,
+    row_nr: u64,
+    failed: bool,
+}
+
+impl<I: Iterator<Item = Result<RecordBatch, ArrowError>>> RowStream<I> {
+    fn new(batches: I) -> Self {
+        Self {
+            batches,
+            buf: Vec::new().into_iter(),
+            row_nr: 0,
+            failed: false,
         }
+    }
+}
+
+impl<I: Iterator<Item = Result<RecordBatch, ArrowError>>> Iterator for RowStream<I> {
+    type Item = Result<Row, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        loop {
+            if let Some(row) = self.buf.next() {
+                return Some(Ok(row));
+            }
+            match self
+                .batches
+                .next()?
+                .and_then(|batch| batch_rows(&batch, &mut self.row_nr))
+            {
+                Ok(rows) => self.buf = rows.into_iter(),
+                Err(e) => {
+                    self.failed = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
+}
+
+fn batch_rows(batch: &RecordBatch, row_nr: &mut u64) -> Result<Vec<Row>, ArrowError> {
+    let c = InCols::new(batch)?;
+    let mut rows = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        rows.push(Row {
+            ts_event: timestamp_ns_at(c.ts_event, i)?,
+            row_nr: *row_nr,
+            sequence: c.sequence.value(i),
+            publisher_id: c.publisher_id.value(i),
+            instrument_id: c.instrument_id.value(i),
+            channel_id: c.channel_id.value(i),
+            action: byte_at(c.action, i)?,
+            side: byte_at(c.side, i)?,
+            price: c.price.value(i),
+            size: c.size.value(i),
+            order_id: c.order_id.value(i),
+            flags: c.flags.value(i),
+        });
+        *row_nr += 1;
     }
     Ok(rows)
 }
 
-pub fn write_depth_parquet(
-    rows: Vec<Row>,
+pub fn write_depth_parquet<I>(
+    rows: I,
     levels: usize,
     out: &str,
-) -> Result<Stats, Box<dyn std::error::Error>> {
+) -> Result<Stats, Box<dyn std::error::Error>>
+where
+    I: IntoIterator<Item = Result<Row, ArrowError>>,
+{
     let mut batches = BookBatchGenerator::new(rows.into_iter(), levels);
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
@@ -287,11 +331,14 @@ pub fn write_depth_parquet(
     Ok(batches.stats().clone())
 }
 
-pub fn write_depth_ipc<W: Write>(
-    rows: Vec<Row>,
+pub fn write_depth_ipc<I, W: Write>(
+    rows: I,
     levels: usize,
     out: W,
-) -> Result<Stats, Box<dyn std::error::Error>> {
+) -> Result<Stats, Box<dyn std::error::Error>>
+where
+    I: IntoIterator<Item = Result<Row, ArrowError>>,
+{
     let mut batches = BookBatchGenerator::new(rows.into_iter(), levels);
     let mut writer = StreamWriter::try_new(out, &batches.schema())?;
     for batch in batches.by_ref() {
@@ -312,7 +359,7 @@ pub struct BookBatchGenerator<I> {
     done: bool,
 }
 
-impl<I: Iterator<Item = Row>> BookBatchGenerator<I> {
+impl<I: Iterator<Item = Result<Row, ArrowError>>> BookBatchGenerator<I> {
     pub fn new(rows: I, levels: usize) -> Self {
         let schema = depth_schema(levels);
         Self {
@@ -340,7 +387,13 @@ impl<I: Iterator<Item = Row>> BookBatchGenerator<I> {
             return Ok(None);
         }
         while let Some(row) = self.rows.next() {
-            self.push_row(row);
+            match row {
+                Ok(row) => self.push_row(row),
+                Err(e) => {
+                    self.done = true;
+                    return Err(e);
+                }
+            }
             if self.buf.len() >= BATCH {
                 return self.buf.take_batch();
             }
@@ -428,7 +481,7 @@ impl<I: Iterator<Item = Row>> BookBatchGenerator<I> {
     }
 }
 
-impl<I: Iterator<Item = Row>> Iterator for BookBatchGenerator<I> {
+impl<I: Iterator<Item = Result<Row, ArrowError>>> Iterator for BookBatchGenerator<I> {
     type Item = Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -831,7 +884,7 @@ struct InCols<'a> {
 }
 
 impl<'a> InCols<'a> {
-    fn new(batch: &'a RecordBatch) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(batch: &'a RecordBatch) -> Result<Self, ArrowError> {
         Ok(Self {
             ts_event: batch.column(batch.schema().index_of("ts_event")?).as_ref(),
             sequence: col(batch, "sequence")?,
@@ -848,23 +901,19 @@ impl<'a> InCols<'a> {
     }
 }
 
-fn col<'a, T: 'static>(
-    batch: &'a RecordBatch,
-    name: &str,
-) -> Result<&'a T, Box<dyn std::error::Error>> {
+fn col<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a T, ArrowError> {
     let i = batch.schema().index_of(name)?;
     batch.column(i).as_any().downcast_ref::<T>().ok_or_else(|| {
-        format!(
+        ArrowError::SchemaError(format!(
             "column {name} has unexpected type {:?}",
             batch.schema().field(i).data_type()
-        )
-        .into()
+        ))
     })
 }
 
-fn byte_at(array: &dyn Array, i: usize) -> Result<u8, Box<dyn std::error::Error>> {
+fn byte_at(array: &dyn Array, i: usize) -> Result<u8, ArrowError> {
     if array.is_null(i) {
-        return Err("null action/side".into());
+        return Err(ArrowError::ParseError("null action/side".into()));
     }
     if let Some(a) = array.as_any().downcast_ref::<LargeStringArray>() {
         return a
@@ -872,7 +921,7 @@ fn byte_at(array: &dyn Array, i: usize) -> Result<u8, Box<dyn std::error::Error>
             .as_bytes()
             .first()
             .copied()
-            .ok_or_else(|| "empty action/side".into());
+            .ok_or_else(|| ArrowError::ParseError("empty action/side".into()));
     }
     if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
         return a
@@ -880,14 +929,17 @@ fn byte_at(array: &dyn Array, i: usize) -> Result<u8, Box<dyn std::error::Error>
             .as_bytes()
             .first()
             .copied()
-            .ok_or_else(|| "empty action/side".into());
+            .ok_or_else(|| ArrowError::ParseError("empty action/side".into()));
     }
-    Err(format!("expected string action/side, got {:?}", array.data_type()).into())
+    Err(ArrowError::SchemaError(format!(
+        "expected string action/side, got {:?}",
+        array.data_type()
+    )))
 }
 
-fn timestamp_ns_at(array: &dyn Array, i: usize) -> Result<i64, Box<dyn std::error::Error>> {
+fn timestamp_ns_at(array: &dyn Array, i: usize) -> Result<i64, ArrowError> {
     if array.is_null(i) {
-        return Err("null ts_event".into());
+        return Err(ArrowError::ParseError("null ts_event".into()));
     }
     if let Some(a) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
         return Ok(a.value(i));
@@ -901,7 +953,10 @@ fn timestamp_ns_at(array: &dyn Array, i: usize) -> Result<i64, Box<dyn std::erro
     if let Some(a) = array.as_any().downcast_ref::<TimestampSecondArray>() {
         return Ok(a.value(i) * 1_000_000_000);
     }
-    Err(format!("expected timestamp ts_event, got {:?}", array.data_type()).into())
+    Err(ArrowError::SchemaError(format!(
+        "expected timestamp ts_event, got {:?}",
+        array.data_type()
+    )))
 }
 
 fn side_code(side: u8) -> Option<u8> {

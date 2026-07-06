@@ -54,7 +54,7 @@ fn run(mut rows: Vec<Row>, levels: usize) -> (Vec<OutRow>, Stats) {
         r.sequence = i as u32;
         r.ts_event = 1_000 + i as i64;
     }
-    let mut gen = BookBatchGenerator::new(rows.into_iter(), levels);
+    let mut gen = BookBatchGenerator::new(rows.into_iter().map(Ok), levels);
     let mut out = Vec::new();
     for batch in gen.by_ref() {
         parse(&batch.unwrap(), levels, &mut out);

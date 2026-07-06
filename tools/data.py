@@ -13,6 +13,8 @@ import exchange_calendars as ec
 import numpy as np
 import polars as pl
 
+from tools.precision import check_precision, float_dtype
+
 _HOLIDAY_CALENDARS = {"cme": "CMES", "regular": "XNYS", "us": "XNYS"}
 _ROOT = Path(__file__).resolve().parents[1]
 RAW_PATH = str(
@@ -58,10 +60,12 @@ class LoadHint:
     polars_engine: str = "streaming"
     state: LoadState = field(default_factory=LoadState)
     front_pad: int = 0
+    precision: str = "float64"
 
     def __post_init__(self) -> None:
         if self.front_pad < 0:
             raise ValueError("front_pad must be nonnegative")
+        object.__setattr__(self, "precision", check_precision(self.precision))
 
 
 Loader = Callable[[list[str]], list[DateFrame]]
@@ -187,10 +191,12 @@ class DataSource:
     cache: dict[tuple[Any, ...], Batch] | None = None
     cache_key: tuple[Any, ...] | None = None
     polars_engine: str = "streaming"
+    precision: str = "float64"
     _frames: list[DateFrame] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.polars_engine = _check_polars_engine(self.polars_engine)
+        self.precision = check_precision(self.precision)
 
     def date_frames(self, hint: LoadHint | None = None) -> list[DateFrame]:
         if hint is not None:
@@ -241,128 +247,166 @@ class DataSource:
     ) -> Iterator[Batch]:
         from tqdm import tqdm
 
+        with tqdm(desc="Loading data", unit="row", unit_scale=True) as bar:
+            for df in self.dataframe_batches(batch_size, multicollect):
+                batch = _to_batch(df, self.features, self.target)
+                bar.update(batch[2]["n"])
+                yield batch
+
+    def dataframe_batches(
+        self,
+        batch_size: int | None = None,
+        multicollect: int = -1,
+        cols: Sequence[str] | None = None,
+        front_pad: int = 0,
+    ) -> Iterator[pl.DataFrame]:
         if multicollect == 0:
             raise ValueError("multicollect must be positive, or negative to disable")
+        if front_pad < 0:
+            raise ValueError("front_pad must be nonnegative")
 
         hint = (
-            LoadHint(batch_size, self.polars_engine)
-            if batch_size is not None
+            LoadHint(
+                batch_size,
+                self.polars_engine,
+                front_pad=front_pad,
+                precision=self.precision,
+            )
+            if batch_size is not None or front_pad > 0
             else None
         )
-        with tqdm(desc="Loading data", unit="row", unit_scale=True) as bar:
-            for item in self.iter_date_frames(hint):
-                internal_cols = _stateful_internal_cols(item.stateful_features)
-                cols = [*self.features, self.target, *CTX_COLS, *internal_cols]
-                if multicollect < 0:
-                    lf = self._prepare(item, cols=cols)
-                    if batch_size is None:
-                        df = lf.collect(engine=self.polars_engine)
-                        if hint is not None:
-                            hint.state.update(item.stateful_features, df)
-                        df = _drop_cols(df, internal_cols)
-                        batch = _to_batch(df, self.features, self.target)
-                        bar.update(batch[2]["n"])
-                        yield batch
-                        continue
-                    for df in lf.collect_batches(
-                        chunk_size=batch_size,
-                        maintain_order=True,
-                        engine=self.polars_engine,
-                    ):
-                        if hint is not None:
-                            hint.state.update(item.stateful_features, df)
-                        batch = _to_batch(
-                            _drop_cols(df, internal_cols), self.features, self.target
-                        )
-                        bar.update(batch[2]["n"])
-                        yield batch
-                    continue
+        selected = _ordered_unique(cols or [*self.features, self.target, *CTX_COLS])
 
-                target_cols = [self.target, *CTX_COLS]
-                feature_groups = [
-                    self.features[i : i + multicollect]
-                    for i in range(0, len(self.features), multicollect)
-                ]
-                stateful_by_name = {
-                    feature.name: feature for feature in item.stateful_features
-                }
-                group_stateful_features = [
-                    tuple(
-                        stateful_by_name[name]
-                        for name in group
-                        if name in stateful_by_name
-                    )
-                    for group in feature_groups
-                ]
-                group_internal_cols = [
-                    _stateful_internal_cols(features)
-                    for features in group_stateful_features
-                ]
-                base_lf = self._prepare(item, select=False)
-                target_lf = base_lf.select(_ordered_unique(target_cols))
-                feature_lfs = [
-                    base_lf.select(_ordered_unique([*group, *cols]))
-                    for group, cols in zip(feature_groups, group_internal_cols)
-                ]
-                if batch_size is None:
-                    df = target_lf.collect(engine=self.polars_engine)
-                    for group, features, lf in zip(
-                        feature_groups,
-                        group_stateful_features,
-                        feature_lfs,
-                    ):
-                        feature_df = lf.collect(engine=self.polars_engine)
-                        if hint is not None:
-                            hint.state.update(features, feature_df)
-                        df = _hstack_unique([df, feature_df.select(group)])
-                    batch = _to_batch(df, self.features, self.target)
-                    bar.update(batch[2]["n"])
-                    yield batch
-                    continue
+        for item in self.iter_date_frames(hint):
+            internal_cols = _stateful_internal_cols(item.stateful_features)
+            if multicollect < 0:
+                yield from self._combined_dataframe_batches(
+                    item,
+                    selected,
+                    internal_cols,
+                    hint,
+                    batch_size,
+                )
+                continue
 
-                feature_iters = [
-                    lf.collect_batches(
-                        chunk_size=batch_size,
-                        maintain_order=True,
-                        engine=self.polars_engine,
-                    )
-                    for lf in feature_lfs
-                ]
-                for df in target_lf.collect_batches(
-                    chunk_size=batch_size,
-                    maintain_order=True,
-                    engine=self.polars_engine,
-                ):
-                    for group, features, it in zip(
-                        feature_groups,
-                        group_stateful_features,
-                        feature_iters,
-                    ):
-                        try:
-                            feature_df = next(it)
-                        except StopIteration as exc:
-                            raise RuntimeError(
-                                "multicollect feature stream ended before target stream"
-                            ) from exc
-                        if feature_df.height != df.height:
-                            raise RuntimeError(
-                                "multicollect feature and target batches have "
-                                f"different heights: {feature_df.height} != {df.height}"
-                            )
-                        if hint is not None:
-                            hint.state.update(features, feature_df)
-                        df = _hstack_unique([df, feature_df.select(group)])
-                    batch = _to_batch(df, self.features, self.target)
-                    bar.update(batch[2]["n"])
-                    yield batch
-                for it in feature_iters:
-                    try:
-                        next(it)
-                    except StopIteration:
-                        continue
+            yield from self._multicollect_dataframe_batches(
+                item,
+                selected,
+                hint,
+                batch_size,
+                multicollect,
+            )
+
+    def _combined_dataframe_batches(
+        self,
+        item: DateFrame,
+        selected: Sequence[str],
+        internal_cols: Sequence[str],
+        hint: LoadHint | None,
+        batch_size: int | None,
+    ) -> Iterator[pl.DataFrame]:
+        lf = self._prepare(item, cols=[*selected, *internal_cols])
+        if batch_size is None:
+            df = lf.collect(engine=self.polars_engine)
+            if hint is not None:
+                hint.state.update(item.stateful_features, df)
+            yield _drop_cols(df, internal_cols).select(selected)
+            return
+
+        for df in lf.collect_batches(
+            chunk_size=batch_size,
+            maintain_order=True,
+            engine=self.polars_engine,
+        ):
+            if hint is not None:
+                hint.state.update(item.stateful_features, df)
+            yield _drop_cols(df, internal_cols).select(selected)
+
+    def _multicollect_dataframe_batches(
+        self,
+        item: DateFrame,
+        selected: Sequence[str],
+        hint: LoadHint | None,
+        batch_size: int | None,
+        multicollect: int,
+    ) -> Iterator[pl.DataFrame]:
+        feature_cols = [col for col in self.features if col in selected]
+        feature_set = set(feature_cols)
+        base_cols = [col for col in selected if col not in feature_set]
+        feature_groups = [
+            feature_cols[i : i + multicollect]
+            for i in range(0, len(feature_cols), multicollect)
+        ]
+        stateful_by_name = {feature.name: feature for feature in item.stateful_features}
+        group_stateful_features = [
+            tuple(stateful_by_name[name] for name in group if name in stateful_by_name)
+            for group in feature_groups
+        ]
+        group_internal_cols = [
+            _stateful_internal_cols(features) for features in group_stateful_features
+        ]
+        base_lf = self._prepare(item, select=False)
+        target_lf = base_lf.select(self._select_exprs(base_cols))
+        feature_lfs = [
+            base_lf.select(self._select_exprs([*group, *cols]))
+            for group, cols in zip(feature_groups, group_internal_cols)
+        ]
+
+        if batch_size is None:
+            df = target_lf.collect(engine=self.polars_engine)
+            for group, features, lf in zip(
+                feature_groups,
+                group_stateful_features,
+                feature_lfs,
+            ):
+                feature_df = lf.collect(engine=self.polars_engine)
+                if hint is not None:
+                    hint.state.update(features, feature_df)
+                df = _hstack_unique([df, feature_df.select(group)])
+            yield df.select(selected)
+            return
+
+        feature_iters = [
+            lf.collect_batches(
+                chunk_size=batch_size,
+                maintain_order=True,
+                engine=self.polars_engine,
+            )
+            for lf in feature_lfs
+        ]
+        for df in target_lf.collect_batches(
+            chunk_size=batch_size,
+            maintain_order=True,
+            engine=self.polars_engine,
+        ):
+            for group, features, it in zip(
+                feature_groups,
+                group_stateful_features,
+                feature_iters,
+            ):
+                try:
+                    feature_df = next(it)
+                except StopIteration as exc:
                     raise RuntimeError(
-                        "multicollect feature stream produced more batches than target stream"
+                        "multicollect feature stream ended before target stream"
+                    ) from exc
+                if feature_df.height != df.height:
+                    raise RuntimeError(
+                        "multicollect feature and target batches have "
+                        f"different heights: {feature_df.height} != {df.height}"
                     )
+                if hint is not None:
+                    hint.state.update(features, feature_df)
+                df = _hstack_unique([df, feature_df.select(group)])
+            yield df.select(selected)
+        for it in feature_iters:
+            try:
+                next(it)
+            except StopIteration:
+                continue
+            raise RuntimeError(
+                "multicollect feature stream produced more batches than target stream"
+            )
 
     def labels(self) -> tuple[np.ndarray, dict[str, Any]]:
         parts = []
@@ -397,6 +441,7 @@ class DataSource:
             cache=self.cache,
             cache_key=cache_key,
             polars_engine=self.polars_engine,
+            precision=self.precision,
         )
         out._frames = self._frames
         return out
@@ -419,7 +464,18 @@ class DataSource:
         if not select:
             return lf
         selected = cols or [*self.features, self.target, *CTX_COLS]
-        return lf.select(_ordered_unique(selected))
+        return lf.select(self._select_exprs(selected))
+
+    def _select_exprs(self, cols: Sequence[str]) -> list[pl.Expr]:
+        public_cols = {*self.features, self.target}
+        dtype = float_dtype(self.precision)
+        exprs: list[pl.Expr] = []
+        for col in _ordered_unique(cols):
+            expr = pl.col(col)
+            if col in public_cols:
+                expr = expr.cast(dtype)
+            exprs.append(expr.alias(col))
+        return exprs
 
 
 class Raw:
@@ -500,6 +556,10 @@ class FeatureLoader:
     batch_size: int = 65_536
     return_time: str = "ts_event"
     return_by: tuple[str, ...] = ("publisher_id", "instrument_id")
+    precision: str = "float64"
+
+    def __post_init__(self) -> None:
+        self.precision = check_precision(self.precision)
 
     def __call__(
         self,
@@ -616,6 +676,7 @@ class FeatureLoader:
                 self.return_time,
                 name,
                 self.return_by,
+                precision=self.precision,
             )
         for name, (depth, total_size) in self.executable_returns.items():
             lf = add_executable_return(
@@ -627,6 +688,7 @@ class FeatureLoader:
                 self.return_time,
                 name,
                 self.return_by,
+                precision=self.precision,
             )
         if window is not None:
             start, stop, _, _, actual_front_pad, _ = window

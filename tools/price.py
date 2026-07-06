@@ -6,6 +6,7 @@ from collections.abc import Sequence
 import polars as pl
 
 from tools.features import Frame, LOBFeatures
+from tools.precision import check_precision, float_dtype, float_lit
 
 
 __all__ = ["add_executable_return", "add_future_executable_price", "add_future_price", "add_return"]
@@ -28,7 +29,9 @@ def add_future_price(
     time: str = "ts_event",
     name: str = "future_price",
     by: Sequence[str] = ("publisher_id", "instrument_id"),
+    precision: str = "float64",
 ) -> Frame:
+    precision = check_precision(precision)
     horizons, weights = _weighted_horizons(horizons, weights)
     if len(horizons) == 0:
         return df
@@ -38,7 +41,7 @@ def add_future_price(
 
     base = lf.with_row_index("__fp_row").with_columns(
         pl.col(time).cast(pl.Datetime("ns")).alias("__fp_t"),
-        expr.cast(pl.Float64).alias("__fp_src"),
+        expr.cast(float_dtype(precision)).alias("__fp_src"),
     )
     max_t = pl.col("__fp_t").max().over(join_by) if join_by else pl.col("__fp_t").max()
     base = base.with_columns(max_t.alias("__fp_max_t"))
@@ -72,11 +75,15 @@ def add_future_price(
             pl.when(pl.col("__fp_target") <= pl.col("__fp_max_t")).then(pl.col(col)).alias(col),
         )
         out = out.join(joined, on="__fp_row", how="left")
-        terms.append(pl.col(col) * weight)
+        terms.append(pl.col(col) * float_lit(weight, precision))
 
     if not terms or total == 0:
         raise ValueError("sum of non-zero weights must not be zero")
-    out = out.with_columns((sum(terms, pl.lit(0.0)) / total).alias(name))
+    out = out.with_columns(
+        (sum(terms, float_lit(0.0, precision)) / float_lit(total, precision))
+        .cast(float_dtype(precision))
+        .alias(name)
+    )
     out = out.sort("__fp_row").drop(["__fp_row", "__fp_t", "__fp_src", "__fp_max_t", *future_cols])
     return out if lazy else out.collect(engine="streaming")
 
@@ -90,15 +97,17 @@ def add_future_executable_price(
     time: str = "ts_event",
     name: str = "future_executable_price",
     by: Sequence[str] = ("publisher_id", "instrument_id"),
+    precision: str = "float64",
 ) -> Frame:
     return add_future_price(
         df,
-        LOBFeatures.size_weighted_avg_price(depth, total_size),
+        LOBFeatures.size_weighted_avg_price(depth, total_size, precision=precision),
         horizons,
         weights,
         time,
         name,
         by,
+        precision,
     )
 
 
@@ -110,12 +119,30 @@ def add_return(
     time: str = "ts_event",
     name: str = "return_bps",
     by: Sequence[str] = ("publisher_id", "instrument_id"),
+    precision: str = "float64",
 ) -> Frame:
+    precision = check_precision(precision)
     lazy = isinstance(df, pl.LazyFrame)
-    out = add_future_price(df, expr, horizons, weights, time, "__future_price", by).lazy()
+    out = add_future_price(
+        df,
+        expr,
+        horizons,
+        weights,
+        time,
+        "__future_price",
+        by,
+        precision,
+    ).lazy()
     if "__future_price" in out.collect_schema():
-        out = out.with_columns(expr.cast(pl.Float64).alias("__price"))
-        out = out.with_columns(((pl.col("__future_price") / pl.col("__price") - 1.0) * 10_000).alias(name))
+        out = out.with_columns(expr.cast(float_dtype(precision)).alias("__price"))
+        out = out.with_columns(
+            (
+                (pl.col("__future_price") / pl.col("__price") - float_lit(1.0, precision))
+                * float_lit(10_000.0, precision)
+            )
+            .cast(float_dtype(precision))
+            .alias(name)
+        )
         out = out.drop("__future_price", "__price")
     return out if lazy else out.collect(engine="streaming")
 
@@ -129,15 +156,17 @@ def add_executable_return(
     time: str = "ts_event",
     name: str = "executable_return_bps",
     by: Sequence[str] = ("publisher_id", "instrument_id"),
+    precision: str = "float64",
 ) -> Frame:
     return add_return(
         df,
-        LOBFeatures.size_weighted_avg_price(depth, total_size),
+        LOBFeatures.size_weighted_avg_price(depth, total_size, precision=precision),
         horizons,
         weights,
         time,
         name,
         by,
+        precision,
     )
 
 

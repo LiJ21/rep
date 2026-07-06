@@ -18,6 +18,7 @@ from tools.features_recipe import (
     HalfLife,
 )
 from tools.orderbook import depth_batches, depth_table_from_arrow
+from tools.precision import check_precision, float_dtype, float_lit
 
 UNDEF_PRICE = 9_223_372_036_854_775_807
 Frame = pl.DataFrame | pl.LazyFrame
@@ -111,14 +112,26 @@ def depth_meta(n: int = 1) -> list[str]:
 
 class LOBFeatures:
     @staticmethod
-    def book_imbalance(depth: int, log: bool = False, eps: float = 1e-12) -> pl.Expr:
-        bid0 = pl.col("bid_px_0").cast(pl.Float64)
-        ask0 = pl.col("ask_px_0").cast(pl.Float64)
-        mid = (bid0 + ask0) / 2
-        half_spread = (ask0 - bid0) / 2
-        bid = LOBFeatures._inv_distance_volume("bid", depth, mid, half_spread)
-        ask = LOBFeatures._inv_distance_volume("ask", depth, mid, half_spread)
-        return LOBFeatures._diff(bid, ask, log, eps)
+    def book_imbalance(
+        depth: int,
+        log: bool = False,
+        eps: float = 1e-12,
+        precision: str = "float64",
+    ) -> pl.Expr:
+        precision = check_precision(precision)
+        bid0 = LOBFeatures._bid0(precision)
+        ask0 = LOBFeatures._ask0(precision)
+        mid = (bid0 + ask0) / float_lit(2.0, precision)
+        half_spread = (ask0 - bid0) / float_lit(2.0, precision)
+        bid = LOBFeatures._inv_distance_volume(
+            "bid", depth, mid, half_spread, precision
+        )
+        ask = LOBFeatures._inv_distance_volume(
+            "ask", depth, mid, half_spread, precision
+        )
+        return LOBFeatures._diff(bid, ask, log, eps, precision).cast(
+            float_dtype(precision)
+        )
 
     @staticmethod
     def size_weighted_price_gap(
@@ -126,20 +139,31 @@ class LOBFeatures:
         total_size: float,
         log: bool = False,
         eps: float = 1e-12,
+        precision: str = "float64",
     ) -> pl.Expr:
-        bid0 = pl.col("bid_px_0").cast(pl.Float64)
-        ask0 = pl.col("ask_px_0").cast(pl.Float64)
-        bid = LOBFeatures._avg_price_for_size("bid", depth, total_size)
-        ask = LOBFeatures._avg_price_for_size("ask", depth, total_size)
-        return 2.0 * LOBFeatures._diff(ask, bid, log, eps) * 1e4
+        precision = check_precision(precision)
+        bid = LOBFeatures._avg_price_for_size("bid", depth, total_size, precision)
+        ask = LOBFeatures._avg_price_for_size("ask", depth, total_size, precision)
+        return (
+            float_lit(2.0, precision)
+            * LOBFeatures._diff(ask, bid, log, eps, precision)
+            * float_lit(1e4, precision)
+        ).cast(float_dtype(precision))
 
     @staticmethod
-    def size_weighted_avg_price(depth: int, total_size: float) -> pl.Expr:
-        bid0 = pl.col("bid_px_0").cast(pl.Float64)
-        ask0 = pl.col("ask_px_0").cast(pl.Float64)
-        bid = LOBFeatures._avg_price_for_size("bid", depth, total_size)
-        ask = LOBFeatures._avg_price_for_size("ask", depth, total_size)
-        return ((bid + ask) / (bid0 + ask0)).log() * 1e4
+    def size_weighted_avg_price(
+        depth: int,
+        total_size: float,
+        precision: str = "float64",
+    ) -> pl.Expr:
+        precision = check_precision(precision)
+        bid0 = LOBFeatures._bid0(precision)
+        ask0 = LOBFeatures._ask0(precision)
+        bid = LOBFeatures._avg_price_for_size("bid", depth, total_size, precision)
+        ask = LOBFeatures._avg_price_for_size("ask", depth, total_size, precision)
+        return (((bid + ask) / (bid0 + ask0)).log() * float_lit(1e4, precision)).cast(
+            float_dtype(precision)
+        )
 
     @dataclass(frozen=True, init=False)
     class BuySellMomentum(ExprFeature):
@@ -151,6 +175,7 @@ class LOBFeatures:
         unit: bool
         normalized: bool
         combine: str
+        precision: str
 
         def __init__(
             self,
@@ -163,10 +188,12 @@ class LOBFeatures:
             unit: bool = False,
             normalized: bool = False,
             combine: str = "diff",
+            precision: str = "float64",
         ) -> None:
             mode = LOBFeatures._check_momentum_mode(mode)
             combine = LOBFeatures._check_momentum_combine(combine)
-            buy, sell = LOBFeatures._momentum_inputs(mode, unit)
+            precision = check_precision(precision)
+            buy, sell = LOBFeatures._momentum_inputs(mode, unit, precision)
             child_time = time if mode == "trade" else self._col_for(name, "time_ns")
             buy_ewma = EwmaFeature(
                 name=f"__ewma_{name}_buy",
@@ -174,6 +201,7 @@ class LOBFeatures:
                 half_life=half_life,
                 time=child_time,
                 normalized=normalized,
+                precision=precision,
             )
             sell_ewma = EwmaFeature(
                 name=f"__ewma_{name}_sell",
@@ -181,22 +209,27 @@ class LOBFeatures:
                 half_life=half_life,
                 time=child_time,
                 normalized=normalized,
+                precision=precision,
             )
             bbo_vol_ewma = EwmaFeature(
                 name=f"__ewma_{name}_bbo_vol",
-                expr=LOBFeatures._bbo_vol(),
+                expr=LOBFeatures._bbo_vol(precision),
                 half_life=half_life,
                 time=child_time,
                 normalized=True,
+                precision=precision,
             )
-            bbo_vol = pl.max_horizontal(pl.col(bbo_vol_ewma.name), pl.lit(eps))
+            bbo_vol = pl.max_horizontal(
+                pl.col(bbo_vol_ewma.name), float_lit(eps, precision)
+            )
             expr = LOBFeatures._combine_momentum_flows(
                 pl.col(buy_ewma.name) / bbo_vol,
                 pl.col(sell_ewma.name) / bbo_vol,
                 combine,
                 log,
                 eps,
-            )
+                precision,
+            ).cast(float_dtype(precision))
 
             object.__setattr__(self, "name", name)
             object.__setattr__(self, "expr", expr)
@@ -211,6 +244,7 @@ class LOBFeatures:
             object.__setattr__(self, "unit", unit)
             object.__setattr__(self, "normalized", normalized)
             object.__setattr__(self, "combine", combine)
+            object.__setattr__(self, "precision", precision)
             self._validate_tree()
 
         def apply(
@@ -245,6 +279,7 @@ class LOBFeatures:
                 "unit": self.unit,
                 "normalized": self.normalized,
                 "combine": self.combine,
+                "precision": self.precision,
             }
 
         def _col(self, suffix: str) -> str:
@@ -265,6 +300,7 @@ class LOBFeatures:
             unit: bool = False,
             normalized: bool = False,
             combine: str = "diff",
+            precision: str = "float64",
         ) -> None:
             super().__init__(
                 name,
@@ -276,6 +312,7 @@ class LOBFeatures:
                 unit=unit,
                 normalized=normalized,
                 combine=combine,
+                precision=precision,
             )
 
     class PushMomentum(BuySellMomentum):
@@ -289,6 +326,7 @@ class LOBFeatures:
             unit: bool = False,
             normalized: bool = False,
             combine: str = "diff",
+            precision: str = "float64",
         ) -> None:
             super().__init__(
                 name,
@@ -300,6 +338,7 @@ class LOBFeatures:
                 unit=unit,
                 normalized=normalized,
                 combine=combine,
+                precision=precision,
             )
 
     class PullMomentum(BuySellMomentum):
@@ -313,6 +352,7 @@ class LOBFeatures:
             unit: bool = False,
             normalized: bool = False,
             combine: str = "diff",
+            precision: str = "float64",
         ) -> None:
             super().__init__(
                 name,
@@ -324,6 +364,7 @@ class LOBFeatures:
                 unit=unit,
                 normalized=normalized,
                 combine=combine,
+                precision=precision,
             )
 
     @dataclass(frozen=True, init=False)
@@ -333,6 +374,7 @@ class LOBFeatures:
         time: str
         eps: float
         normalized: bool
+        precision: str
 
         def __init__(
             self,
@@ -341,13 +383,16 @@ class LOBFeatures:
             mode: str = "side",
             time: str = "ts_event",
             eps: float = 1e-12,
+            precision: str = "float64",
         ) -> None:
             mode = LOBFeatures._check_trade_correlation_mode(mode)
-            trade_row = LOBFeatures._trade_row()
-            value = LOBFeatures._signed_trade_value(mode)
+            precision = check_precision(precision)
+            trade_row = LOBFeatures._trade_row(precision)
+            value = LOBFeatures._signed_trade_value(mode, precision)
             v_prev = CarryForwardFeature(
                 name=f"__carry_{name}_v_prev",
                 expr=pl.when(trade_row).then(value).otherwise(None),
+                precision=precision,
             )
             pair = trade_row & pl.col(v_prev.name).is_not_null()
             v = pl.when(pair).then(value).otherwise(None)
@@ -357,6 +402,7 @@ class LOBFeatures:
                 half_life=half_life,
                 time=time,
                 normalized=True,
+                precision=precision,
             )
             m_vv = EwmaFeature(
                 name=f"__ewma_{name}_vv",
@@ -366,13 +412,17 @@ class LOBFeatures:
                 half_life=half_life,
                 time=time,
                 normalized=True,
+                precision=precision,
             )
             pair_mass = EwmaFeature(
                 name=f"__ewma_{name}_pair_mass",
-                expr=pl.when(pair).then(1.0).otherwise(0.0),
+                expr=pl.when(pair)
+                .then(float_lit(1.0, precision))
+                .otherwise(float_lit(0.0, precision)),
                 half_life=half_life,
                 time=time,
                 normalized=False,
+                precision=precision,
             )
             sub_features: tuple[Any, ...] = (v_prev, m_v, m_vv)
             if mode == "volume":
@@ -382,24 +432,26 @@ class LOBFeatures:
                     half_life=half_life,
                     time=time,
                     normalized=True,
+                    precision=precision,
                 )
                 sub_features = (*sub_features, m_v2)
                 s2 = pl.col(m_v2.name)
             else:
-                s2 = pl.lit(1.0)
+                s2 = float_lit(1.0, precision)
             sub_features = (*sub_features, pair_mass)
 
             m = pl.col(m_v.name)
             q = pl.col(m_vv.name)
             variance = s2 - (m * m)
-            rho = ((q - (m * m)) / (variance + eps)).clip(
+            rho = ((q - (m * m)) / (variance + float_lit(eps, precision))).clip(
                 lower_bound=-1.0,
                 upper_bound=1.0,
             )
             expr = (
-                pl.when(pl.col(pair_mass.name) > eps)
+                pl.when(pl.col(pair_mass.name) > float_lit(eps, precision))
                 .then(rho)
                 .otherwise(None)
+                .cast(float_dtype(precision))
             )
 
             object.__setattr__(self, "name", name)
@@ -410,6 +462,7 @@ class LOBFeatures:
             object.__setattr__(self, "time", time)
             object.__setattr__(self, "eps", eps)
             object.__setattr__(self, "normalized", True)
+            object.__setattr__(self, "precision", precision)
             self._validate_tree()
 
         def to_config(self) -> dict[str, Any]:
@@ -420,6 +473,7 @@ class LOBFeatures:
                 "time": self.time,
                 "eps": self.eps,
                 "normalized": self.normalized,
+                "precision": self.precision,
             }
 
     class LogReturn(EwmaFeature):
@@ -429,16 +483,19 @@ class LOBFeatures:
             half_life: HalfLife,
             time: str = "ts_event",
             normalized: bool = False,
+            precision: str = "float64",
         ) -> None:
-            valid = LOBFeatures._bbo_valid()
-            mid = pl.when(valid).then(LOBFeatures._mid()).otherwise(None)
-            expr = (mid / mid.shift(1)).log()
+            precision = check_precision(precision)
+            valid = LOBFeatures._bbo_valid(precision)
+            mid = pl.when(valid).then(LOBFeatures._mid(precision)).otherwise(None)
+            expr = (mid / mid.shift(1)).log() * float_lit(1e4, precision)
             super().__init__(
                 name=name,
                 expr=expr,
                 half_life=half_life,
                 time=time,
                 normalized=normalized,
+                precision=precision,
             )
 
     class EwmaSpread(EwmaFeature):
@@ -447,72 +504,103 @@ class LOBFeatures:
             name: str,
             half_life: HalfLife,
             time: str = "ts_event",
+            precision: str = "float64",
         ) -> None:
-            valid = LOBFeatures._bbo_valid()
-            mid = LOBFeatures._mid()
-            spread = (LOBFeatures._ask0() - LOBFeatures._bid0()) / mid
-            expr = pl.when(valid & (mid > 0)).then(spread).otherwise(None)
+            precision = check_precision(precision)
+            valid = LOBFeatures._bbo_valid(precision)
+            mid = LOBFeatures._mid(precision)
+            spread = (LOBFeatures._ask0(precision) - LOBFeatures._bid0(precision)) / mid
+            expr = (
+                pl.when(valid & (mid > 0))
+                .then(spread * float_lit(1e4, precision))
+                .otherwise(None)
+            )
             super().__init__(
                 name=name,
                 expr=expr,
                 half_life=half_life,
                 time=time,
                 normalized=True,
+                precision=precision,
             )
 
     @staticmethod
-    def _diff(left: pl.Expr, right: pl.Expr, log: bool, eps: float) -> pl.Expr:
+    def _diff(
+        left: pl.Expr,
+        right: pl.Expr,
+        log: bool,
+        eps: float,
+        precision: str,
+    ) -> pl.Expr:
+        eps_expr = float_lit(eps, precision)
         return (
-            (left + eps).log() - (right + eps).log()
+            (left + eps_expr).log() - (right + eps_expr).log()
             if log
-            else (left - right) / (left + right + eps)
+            else (left - right) / (left + right + eps_expr)
         )
 
     @staticmethod
     def _combine_momentum_flows(
-        buy: pl.Expr, sell: pl.Expr, combine: str, log: bool, eps: float
+        buy: pl.Expr,
+        sell: pl.Expr,
+        combine: str,
+        log: bool,
+        eps: float,
+        precision: str,
     ) -> pl.Expr:
+        one = float_lit(1.0, precision)
+        eps_expr = float_lit(eps, precision)
         if combine == "diff":
-            return LOBFeatures._diff(pl.lit(1.0) + buy, pl.lit(1.0) + sell, log, eps)
+            return LOBFeatures._diff(one + buy, one + sell, log, eps, precision)
         if log:
-            return (((pl.lit(1.0) + buy) * (pl.lit(1.0) + sell)) + eps).log()
+            return (((one + buy) * (one + sell)) + eps_expr).log()
         return buy + sell
 
     @staticmethod
-    def _bid0() -> pl.Expr:
-        return pl.col("bid_px_0").cast(pl.Float64)
+    def _bid0(precision: str = "float64") -> pl.Expr:
+        return pl.col("bid_px_0").cast(float_dtype(precision))
 
     @staticmethod
-    def _ask0() -> pl.Expr:
-        return pl.col("ask_px_0").cast(pl.Float64)
+    def _ask0(precision: str = "float64") -> pl.Expr:
+        return pl.col("ask_px_0").cast(float_dtype(precision))
 
     @staticmethod
-    def _mid() -> pl.Expr:
-        return (LOBFeatures._bid0() + LOBFeatures._ask0()) / 2
-
-    @staticmethod
-    def _bbo_vol() -> pl.Expr:
-        return 0.5 * (
-            pl.col("bid_sz_0").cast(pl.Float64).fill_null(0.0)
-            + pl.col("ask_sz_0").cast(pl.Float64).fill_null(0.0)
+    def _mid(precision: str = "float64") -> pl.Expr:
+        return (LOBFeatures._bid0(precision) + LOBFeatures._ask0(precision)) / float_lit(
+            2.0, precision
         )
 
     @staticmethod
-    def _bbo_valid() -> pl.Expr:
+    def _bbo_vol(precision: str = "float64") -> pl.Expr:
+        return float_lit(0.5, precision) * (
+            pl.col("bid_sz_0")
+            .cast(float_dtype(precision))
+            .fill_null(float_lit(0.0, precision))
+            + pl.col("ask_sz_0")
+            .cast(float_dtype(precision))
+            .fill_null(float_lit(0.0, precision))
+        )
+
+    @staticmethod
+    def _bbo_valid(precision: str = "float64") -> pl.Expr:
         return (
-            LOBFeatures._valid(LOBFeatures._bid0(), pl.col("bid_sz_0").cast(pl.Float64))
+            LOBFeatures._valid(
+                LOBFeatures._bid0(precision),
+                pl.col("bid_sz_0").cast(float_dtype(precision)),
+            )
             & LOBFeatures._valid(
-                LOBFeatures._ask0(), pl.col("ask_sz_0").cast(pl.Float64)
+                LOBFeatures._ask0(precision),
+                pl.col("ask_sz_0").cast(float_dtype(precision)),
             )
         ).fill_null(False)
 
     @staticmethod
-    def _px(side: str, i: int) -> pl.Expr:
-        return pl.col(f"{side}_px_{i}").cast(pl.Float64)
+    def _px(side: str, i: int, precision: str = "float64") -> pl.Expr:
+        return pl.col(f"{side}_px_{i}").cast(float_dtype(precision))
 
     @staticmethod
-    def _sz(side: str, i: int) -> pl.Expr:
-        return pl.col(f"{side}_sz_{i}").cast(pl.Float64)
+    def _sz(side: str, i: int, precision: str = "float64") -> pl.Expr:
+        return pl.col(f"{side}_sz_{i}").cast(float_dtype(precision))
 
     @staticmethod
     def _valid(px: pl.Expr, sz: pl.Expr) -> pl.Expr:
@@ -520,32 +608,45 @@ class LOBFeatures:
 
     @staticmethod
     def _inv_distance_volume(
-        side: str, depth: int, mid: pl.Expr, half_spread: pl.Expr
+        side: str,
+        depth: int,
+        mid: pl.Expr,
+        half_spread: pl.Expr,
+        precision: str,
     ) -> pl.Expr:
-        out = pl.lit(0.0)
+        out = float_lit(0.0, precision)
         for i in range(depth):
-            px, sz = LOBFeatures._px(side, i), LOBFeatures._sz(side, i)
+            px, sz = LOBFeatures._px(side, i, precision), LOBFeatures._sz(
+                side, i, precision
+            )
             dist = (
                 (mid - px) / half_spread if side == "bid" else (px - mid) / half_spread
             )
             out += (
                 pl.when(LOBFeatures._valid(px, sz) & (half_spread > 0) & (dist > 0))
                 .then(sz / dist)
-                .otherwise(0.0)
+                .otherwise(float_lit(0.0, precision))
             )
         return out
 
     @staticmethod
-    def _avg_price_for_size(side: str, depth: int, total_size: float) -> pl.Expr:
-        remaining = pl.lit(float(total_size))
-        qty = pl.lit(0.0)
-        cost = pl.lit(0.0)
+    def _avg_price_for_size(
+        side: str,
+        depth: int,
+        total_size: float,
+        precision: str,
+    ) -> pl.Expr:
+        remaining = float_lit(float(total_size), precision)
+        qty = float_lit(0.0, precision)
+        cost = float_lit(0.0, precision)
         for i in range(depth):
-            px, sz = LOBFeatures._px(side, i), LOBFeatures._sz(side, i)
+            px, sz = LOBFeatures._px(side, i, precision), LOBFeatures._sz(
+                side, i, precision
+            )
             take = (
                 pl.when(LOBFeatures._valid(px, sz) & (remaining > 0))
                 .then(pl.min_horizontal(sz, remaining))
-                .otherwise(0.0)
+                .otherwise(float_lit(0.0, precision))
             )
             qty += take
             cost += take * px
@@ -571,86 +672,102 @@ class LOBFeatures:
         return mode
 
     @staticmethod
-    def _momentum_inputs(mode: str, unit: bool) -> tuple[pl.Expr, pl.Expr]:
+    def _momentum_inputs(
+        mode: str,
+        unit: bool,
+        precision: str,
+    ) -> tuple[pl.Expr, pl.Expr]:
         if mode == "trade":
             return (
-                LOBFeatures._trade_side_input(0, unit),
-                LOBFeatures._trade_side_input(1, unit),
+                LOBFeatures._trade_side_input(0, unit, precision),
+                LOBFeatures._trade_side_input(1, unit, precision),
             )
         if mode == "push":
             return (
-                LOBFeatures._book_push_input("bid", unit),
-                LOBFeatures._book_push_input("ask", unit),
+                LOBFeatures._book_push_input("bid", unit, precision),
+                LOBFeatures._book_push_input("ask", unit, precision),
             )
         if mode == "pull":
             return (
-                LOBFeatures._book_pull_input("ask", unit),
-                LOBFeatures._book_pull_input("bid", unit),
+                LOBFeatures._book_pull_input("ask", unit, precision),
+                LOBFeatures._book_pull_input("bid", unit, precision),
             )
         raise ValueError("momentum mode must be one of: 'trade', 'push', 'pull'")
 
     @staticmethod
-    def _trade_side_input(side: int, unit: bool) -> pl.Expr:
+    def _trade_side_input(side: int, unit: bool, precision: str) -> pl.Expr:
         if unit:
-            return pl.when(pl.col("trade_side") == side).then(1.0).otherwise(0.0)
+            return (
+                pl.when(pl.col("trade_side") == side)
+                .then(float_lit(1.0, precision))
+                .otherwise(float_lit(0.0, precision))
+            )
         return (
             pl.when(pl.col("trade_side") == side)
-            .then(pl.col("trade_sz").cast(pl.Float64))
-            .otherwise(0.0)
+            .then(pl.col("trade_sz").cast(float_dtype(precision)))
+            .otherwise(float_lit(0.0, precision))
         )
 
     @staticmethod
-    def _trade_row() -> pl.Expr:
-        trade_size = pl.col("trade_sz").cast(pl.Float64).fill_null(0.0)
+    def _trade_row(precision: str = "float64") -> pl.Expr:
+        trade_size = (
+            pl.col("trade_sz")
+            .cast(float_dtype(precision))
+            .fill_null(float_lit(0.0, precision))
+        )
         return (pl.col("trade_side").is_in([0, 1]) & (trade_size > 0)).fill_null(
             False
         )
 
     @staticmethod
-    def _trade_side_sign() -> pl.Expr:
-        side = pl.col("trade_side").cast(pl.Float64)
+    def _trade_side_sign(precision: str) -> pl.Expr:
+        side = pl.col("trade_side").cast(float_dtype(precision))
         return (
             pl.when(pl.col("trade_side").is_in([0, 1]))
-            .then(1.0 - 2.0 * side)
+            .then(float_lit(1.0, precision) - float_lit(2.0, precision) * side)
             .otherwise(None)
         )
 
     @staticmethod
-    def _signed_trade_value(mode: str) -> pl.Expr:
-        sign = LOBFeatures._trade_side_sign()
+    def _signed_trade_value(mode: str, precision: str) -> pl.Expr:
+        sign = LOBFeatures._trade_side_sign(precision)
         if mode == "side":
             return sign
         if mode == "volume":
-            return sign * pl.col("trade_sz").cast(pl.Float64).log1p()
+            return sign * pl.col("trade_sz").cast(float_dtype(precision)).log1p()
         raise ValueError("trade correlation mode must be one of: 'side', 'volume'")
 
     @staticmethod
-    def _book_push_input(side: str, unit: bool) -> pl.Expr:
-        px = LOBFeatures._px(side, 0)
-        sz = LOBFeatures._sz(side, 0).fill_null(0.0)
+    def _book_push_input(side: str, unit: bool, precision: str) -> pl.Expr:
+        px = LOBFeatures._px(side, 0, precision)
+        sz = LOBFeatures._sz(side, 0, precision).fill_null(
+            float_lit(0.0, precision)
+        )
         prev_px = px.shift(1)
-        prev_sz = sz.shift(1).fill_null(0.0)
+        prev_sz = sz.shift(1).fill_null(float_lit(0.0, precision))
         diff = sz - prev_sz
         current_valid = LOBFeatures._valid(px, sz).fill_null(False)
         previous_valid = LOBFeatures._valid(prev_px, prev_sz).fill_null(False)
         same_price = current_valid & previous_valid & (px == prev_px)
         more_aggressive = px > prev_px if side == "bid" else px < prev_px
-        trade_row = LOBFeatures._trade_row()
+        trade_row = LOBFeatures._trade_row(precision)
         event = (
             pl.when(~trade_row & current_valid & previous_valid & more_aggressive)
             .then(sz)
             .when(~trade_row & same_price & (diff > 0))
             .then(diff)
-            .otherwise(0.0)
+            .otherwise(float_lit(0.0, precision))
         )
-        return LOBFeatures._unitize(event, unit)
+        return LOBFeatures._unitize(event, unit, precision)
 
     @staticmethod
-    def _book_pull_input(side: str, unit: bool) -> pl.Expr:
-        px = LOBFeatures._px(side, 0)
-        sz = LOBFeatures._sz(side, 0).fill_null(0.0)
+    def _book_pull_input(side: str, unit: bool, precision: str) -> pl.Expr:
+        px = LOBFeatures._px(side, 0, precision)
+        sz = LOBFeatures._sz(side, 0, precision).fill_null(
+            float_lit(0.0, precision)
+        )
         prev_px = px.shift(1)
-        prev_sz = sz.shift(1).fill_null(0.0)
+        prev_sz = sz.shift(1).fill_null(float_lit(0.0, precision))
         diff = sz - prev_sz
         current_valid = LOBFeatures._valid(px, sz).fill_null(False)
         previous_valid = LOBFeatures._valid(prev_px, prev_sz).fill_null(False)
@@ -659,25 +776,34 @@ class LOBFeatures:
         level_cancelled = previous_valid & (
             ~current_valid | (current_valid & less_aggressive)
         )
-        trade_row = LOBFeatures._trade_row()
+        trade_row = LOBFeatures._trade_row(precision)
         event = (
             pl.when(~trade_row & level_cancelled)
             .then(prev_sz)
             .when(~trade_row & same_price & (diff < 0))
             .then(-diff)
-            .otherwise(0.0)
+            .otherwise(float_lit(0.0, precision))
         )
-        return LOBFeatures._unitize(event, unit)
+        return LOBFeatures._unitize(event, unit, precision)
 
     @staticmethod
-    def _book_size_diff(side: str) -> pl.Expr:
-        return pl.col(f"{side}_sz_0").cast(pl.Float64).diff().fill_null(0.0)
+    def _book_size_diff(side: str, precision: str = "float64") -> pl.Expr:
+        return (
+            pl.col(f"{side}_sz_0")
+            .cast(float_dtype(precision))
+            .diff()
+            .fill_null(float_lit(0.0, precision))
+        )
 
     @staticmethod
-    def _unitize(expr: pl.Expr, unit: bool) -> pl.Expr:
+    def _unitize(expr: pl.Expr, unit: bool, precision: str) -> pl.Expr:
         if not unit:
-            return expr
-        return pl.when(expr > 0).then(1.0).otherwise(0.0)
+            return expr.cast(float_dtype(precision))
+        return (
+            pl.when(expr > 0)
+            .then(float_lit(1.0, precision))
+            .otherwise(float_lit(0.0, precision))
+        )
 
     @staticmethod
     def _json_ready_half_life(half_life: HalfLife) -> str | int | float:

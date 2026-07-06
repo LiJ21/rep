@@ -14,6 +14,7 @@ from typing import Any
 import polars as pl
 
 from tools.feature_plugin import ewma_unnormalized
+from tools.precision import check_precision, float_dtype, float_lit
 
 HalfLife = str | timedelta | int | float
 SELF_CARRYOVER = "__self__"
@@ -124,6 +125,12 @@ class ExprFeature:
 
 @dataclass(frozen=True)
 class CarryForwardFeature(ExprFeature):
+    precision: str = "float64"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        object.__setattr__(self, "precision", check_precision(self.precision))
+
     def apply(
         self, lf: pl.LazyFrame, carryover: Any | None, front_pad: int = 0
     ) -> pl.LazyFrame:
@@ -136,7 +143,7 @@ class CarryForwardFeature(ExprFeature):
 
         lf = lf.with_columns(
             pl.lit(False).alias(seed_col),
-            self.expr.cast(pl.Float64).alias(input_col),
+            self.expr.cast(float_dtype(self.precision)).alias(input_col),
         )
         if own_carryover is not None and front_pad > 0:
             return self._apply_front_padded_carry(
@@ -151,7 +158,10 @@ class CarryForwardFeature(ExprFeature):
             seed = pl.DataFrame(
                 {
                     seed_col: [True],
-                    input_col: [_carry_forward_value(own_carryover)],
+                    input_col: pl.Series(
+                        [_carry_forward_value(own_carryover)],
+                        dtype=float_dtype(self.precision),
+                    ),
                 }
             ).lazy()
             lf = pl.concat([seed, lf], how="diagonal_relaxed")
@@ -179,7 +189,7 @@ class CarryForwardFeature(ExprFeature):
                 .otherwise(pl.col(seed_col))
                 .alias(seed_col),
                 pl.when(pl.col(order_col) == seed_idx)
-                .then(pl.lit(_carry_forward_value(own_carryover)))
+                .then(float_lit(_carry_forward_value(own_carryover), self.precision))
                 .otherwise(pl.col(input_col))
                 .alias(input_col),
             )
@@ -189,8 +199,8 @@ class CarryForwardFeature(ExprFeature):
             return active.drop(order_col)
 
         inactive = lf.filter(pl.col(order_col) < seed_idx).with_columns(
-            pl.lit(None, dtype=pl.Float64).alias(current_col),
-            pl.lit(None, dtype=pl.Float64).alias(self.name),
+            float_lit(None, self.precision).alias(current_col),
+            float_lit(None, self.precision).alias(self.name),
         )
         return (
             pl.concat([inactive, active], how="diagonal_relaxed")
@@ -234,6 +244,9 @@ class CarryForwardFeature(ExprFeature):
             pl.col(input_col).forward_fill().alias(current_col)
         ).with_columns(pl.col(current_col).shift(1).alias(self.name))
 
+    def to_config(self) -> dict[str, Any]:
+        return {**super().to_config(), "precision": self.precision}
+
     def _col(self, suffix: str) -> str:
         return f"__{self.name}_{suffix}"
 
@@ -243,6 +256,11 @@ class EwmaFeature(ExprFeature):
     half_life: HalfLife = 1.0
     time: str = "ts_event"
     normalized: bool = True
+    precision: str = "float64"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        object.__setattr__(self, "precision", check_precision(self.precision))
 
     def apply(
         self, lf: pl.LazyFrame, carryover: Any | None, front_pad: int = 0
@@ -275,7 +293,10 @@ class EwmaFeature(ExprFeature):
                 {
                     seed_col: [True],
                     time_col: [own_carryover.time_ns],
-                    input_col: [own_carryover.value],
+                    input_col: pl.Series(
+                        [own_carryover.value],
+                        dtype=float_dtype(self.precision),
+                    ),
                 }
             ).lazy()
             lf = pl.concat([seed, lf], how="diagonal_relaxed")
@@ -311,7 +332,7 @@ class EwmaFeature(ExprFeature):
                 .otherwise(pl.col(time_col))
                 .alias(time_col),
                 pl.when(pl.col(order_col) == seed_idx)
-                .then(pl.lit(own_carryover.value))
+                .then(float_lit(own_carryover.value, self.precision))
                 .otherwise(pl.col(input_col))
                 .alias(input_col),
             )
@@ -324,7 +345,7 @@ class EwmaFeature(ExprFeature):
             return active.drop(order_col)
 
         inactive = lf.filter(pl.col(order_col) < seed_idx).with_columns(
-            pl.lit(None, dtype=pl.Float64).alias(self.name)
+            float_lit(None, self.precision).alias(self.name)
         )
         return (
             pl.concat([inactive, active], how="diagonal_relaxed")
@@ -359,6 +380,7 @@ class EwmaFeature(ExprFeature):
             "half_life": _json_ready_half_life(self.half_life),
             "time": self.time,
             "normalized": self.normalized,
+            "precision": self.precision,
         }
 
     def _get_own_carryover(self, df: pl.DataFrame) -> EwmaCarryover | None:
@@ -376,8 +398,8 @@ class EwmaFeature(ExprFeature):
         return EwmaCarryover(int(time_ns), float(value))
 
     def _input_expr(self) -> pl.Expr:
-        expr = self.expr.cast(pl.Float64)
-        return expr if self.normalized else expr.fill_null(0.0)
+        expr = self.expr.cast(float_dtype(self.precision))
+        return expr if self.normalized else expr.fill_null(float_lit(0.0, self.precision))
 
     def _state_time_expr(self, input_col: str, time_col: str) -> pl.Expr:
         if not self.normalized:
@@ -391,7 +413,8 @@ class EwmaFeature(ExprFeature):
 
     def _output_expr(self, input_col: str, time_col: str) -> pl.Expr:
         expr = self._ewm_expr(input_col, time_col)
-        return expr.forward_fill() if self.normalized else expr
+        expr = expr.forward_fill() if self.normalized else expr
+        return expr.cast(float_dtype(self.precision))
 
     def _ewm_expr(self, input_col: str, time_col: str) -> pl.Expr:
         if self.normalized:
@@ -402,16 +425,17 @@ class EwmaFeature(ExprFeature):
         return pl.col(input_col).ewm_mean_by(
             pl.col(time_col),
             half_life=_half_life(self.half_life),
-        )
+        ).cast(float_dtype(self.precision))
 
     def _unnormalized_ewm_expr(self, input_col: str, time_col: str) -> pl.Expr:
         rust_expr = ewma_unnormalized(
             pl.col(input_col),
             pl.col(time_col),
             float(_half_life_ns(self.half_life)),
+            precision=self.precision,
         )
         if rust_expr is not None:
-            return rust_expr
+            return rust_expr.cast(float_dtype(self.precision))
 
         input_expr = pl.col(input_col)
         time_expr = pl.col(time_col)
@@ -422,19 +446,25 @@ class EwmaFeature(ExprFeature):
         group_cumulative = input_expr.cum_sum().over(time_col)
         adjusted_input = (
             pl.when(first_at_time)
-            .then(group_total / self._alpha_expr(time_col).fill_null(1.0))
-            .otherwise(0.0)
+            .then(group_total / self._alpha_expr(time_col).fill_null(float_lit(1.0, self.precision)))
+            .otherwise(float_lit(0.0, self.precision))
         )
         group_end = adjusted_input.ewm_mean_by(
             time_expr,
             half_life=_half_life(self.half_life),
         )
-        return group_end - (group_total - group_cumulative)
+        return (group_end - (group_total - group_cumulative)).cast(
+            float_dtype(self.precision)
+        )
 
     def _alpha_expr(self, time_col: str) -> pl.Expr:
-        dt = (pl.col(time_col) - pl.col(time_col).shift(1)).cast(pl.Float64)
+        dt = (pl.col(time_col) - pl.col(time_col).shift(1)).cast(
+            float_dtype(self.precision)
+        )
         exponent = -log(2.0) * dt / float(_half_life_ns(self.half_life))
-        return 1.0 - exponent.exp()
+        return (float_lit(1.0, self.precision) - exponent.exp()).cast(
+            float_dtype(self.precision)
+        )
 
     def _col(self, suffix: str) -> str:
         return f"__{self.name}_{suffix}"

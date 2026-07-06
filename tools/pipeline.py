@@ -20,6 +20,7 @@ import numpy as np
 import polars as pl
 
 from tools.data import POLARS_ENGINES, DataSource, Loader
+from tools.precision import check_precision
 from tools.registry import Registry
 from tools.search import (
     BySizeRecency,
@@ -535,6 +536,7 @@ class Pipeline:
     cache_arrays: bool = False
     seed: int | None = None
     polars_engine: str = "streaming"
+    precision: str = "float64"
     refit_val_dates: list[str] | None = None
 
     model: Any = field(default=None, init=False)
@@ -551,6 +553,7 @@ class Pipeline:
         self.polars_engine = self.polars_engine.lower()
         if self.polars_engine not in POLARS_ENGINES:
             raise ValueError(f"polars_engine must be one of: {sorted(POLARS_ENGINES)}")
+        self.precision = check_precision(self.precision)
         self.train_filters = tuple(self.train_filters)
         self.val_filters = tuple(self.val_filters)
         self.test_filters = tuple(self.test_filters)
@@ -581,6 +584,7 @@ class Pipeline:
                 "n_folds": len(folds),
                 "score_direction": self.score_direction,
                 "polars_engine": self.polars_engine,
+                "precision": self.precision,
                 "no_refit": no_refit,
             }
         )
@@ -990,7 +994,7 @@ class Pipeline:
         return self.model
 
     def _fit_transform(self, dates: Sequence[str]) -> Transform:
-        key = (tuple(dates), self.polars_engine)
+        key = (tuple(dates), self.polars_engine, self.precision)
         if key not in self._transform_cache:
             src = self._src(dates, self.train_filters, None, "fit")
             transform = copy.deepcopy(self.transform)
@@ -1004,7 +1008,7 @@ class Pipeline:
         transform: Transform | None,
         role: str,
     ) -> DataSource:
-        key = (role, tuple(dates), id(transform), self.polars_engine)
+        key = (role, tuple(dates), id(transform), self.polars_engine, self.precision)
         return DataSource(
             dates=list(dates),
             loader=self.data_loader,
@@ -1015,6 +1019,7 @@ class Pipeline:
             cache=self._array_cache if self.cache_arrays else None,
             cache_key=key,
             polars_engine=self.polars_engine,
+            precision=self.precision,
         )
 
     def _fit_model(

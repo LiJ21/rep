@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, Int64Array, LargeStringArray, RecordBatch, StringArray,
+    Array, ArrayRef, Float64Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
@@ -13,10 +13,11 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::{ArrowWriter, ProjectionMask};
+use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
+const F_LAST: u8 = 128;
 const F_TOB: u8 = 64;
-const SNAPSHOT: u8 = 32;
 pub const UNDEF_PRICE: i64 = 9_223_372_036_854_775_807;
 pub const BATCH: usize = 65_536;
 
@@ -44,6 +45,8 @@ struct Book {
 pub struct Stats {
     pub rows: u64,
     pub emitted: u64,
+    pub blocks: u64,
+    pub trade_blocks: u64,
     pub adds: u64,
     pub cancels: u64,
     pub modifies: u64,
@@ -54,6 +57,11 @@ pub struct Stats {
     pub duplicate_adds: u64,
     pub bad_sides: u64,
     pub unknown_actions: u64,
+    pub mixed_side_trade_blocks: u64,
+    pub sideless_trades: u64,
+    pub zero_size_adds: u64,
+    pub unterminated_blocks: u64,
+    pub ts_regressions: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -83,6 +91,121 @@ struct TopLevel {
 struct Top {
     bids: Vec<TopLevel>,
     asks: Vec<TopLevel>,
+}
+
+#[derive(Clone, Copy)]
+struct EmitMeta {
+    ts_event: i64,
+    row_nr: u64,
+    sequence: u32,
+}
+
+/// Per-side trade aggregate over one F_LAST event block. Databento emits one
+/// `T` per swept price level (order_id = aggressor) and one `F` per resting
+/// order; `sum(T.size)` is the traded quantity while `F` can double-count
+/// self-fills of a repriced aggressor.
+struct TradeAgg {
+    side: u8,
+    qty: u64,
+    px_qty: u64,
+    notional: f64,
+    px_min: i64,
+    px_max: i64,
+    px_first: i64,
+    px_last: i64,
+    levels: u32,
+    fills: u32,
+    posted: u64,
+    ids: Vec<u64>,
+    ts_event: i64,
+    row_nr: u64,
+    sequence: u32,
+}
+
+impl TradeAgg {
+    fn new(row: &Row) -> Self {
+        Self {
+            side: row.side,
+            qty: 0,
+            px_qty: 0,
+            notional: 0.0,
+            px_min: i64::MAX,
+            px_max: i64::MIN,
+            px_first: UNDEF_PRICE,
+            px_last: UNDEF_PRICE,
+            levels: 0,
+            fills: 0,
+            posted: 0,
+            ids: Vec::new(),
+            ts_event: row.ts_event,
+            row_nr: row.row_nr,
+            sequence: row.sequence,
+        }
+    }
+
+    fn record_trade(&mut self, row: &Row) {
+        self.qty += row.size as u64;
+        self.levels += 1;
+        if row.price != UNDEF_PRICE {
+            self.px_qty += row.size as u64;
+            self.notional += row.price as f64 * row.size as f64;
+            self.px_min = self.px_min.min(row.price);
+            self.px_max = self.px_max.max(row.price);
+            if self.px_first == UNDEF_PRICE {
+                self.px_first = row.price;
+            }
+            self.px_last = row.price;
+        }
+        if row.order_id != 0 && !self.ids.contains(&row.order_id) {
+            self.ids.push(row.order_id);
+        }
+    }
+
+    fn px_best(&self) -> Option<i64> {
+        (self.px_first != UNDEF_PRICE).then_some(match self.side {
+            b'B' => self.px_min,
+            b'A' => self.px_max,
+            _ => self.px_first,
+        })
+    }
+
+    fn px_worst(&self) -> Option<i64> {
+        (self.px_first != UNDEF_PRICE).then_some(match self.side {
+            b'B' => self.px_max,
+            b'A' => self.px_min,
+            _ => self.px_last,
+        })
+    }
+
+    fn vwap(&self) -> Option<f64> {
+        (self.px_qty > 0).then(|| self.notional / self.px_qty as f64)
+    }
+}
+
+struct BookState {
+    book: Book,
+    last_top: Top,
+    pending: Vec<TradeAgg>,
+    dirty: bool,
+    last_meta: EmitMeta,
+}
+
+impl BookState {
+    fn new(levels: usize) -> Self {
+        let book = Book::default();
+        let last_top = book.top(levels);
+        Self {
+            book,
+            last_top,
+            pending: Vec::new(),
+            dirty: false,
+            last_meta: EmitMeta {
+                ts_event: 0,
+                row_nr: 0,
+                sequence: 0,
+            },
+        }
+    }
 }
 
 pub fn depth_schema(levels: usize) -> Arc<Schema> {
@@ -147,27 +270,15 @@ where
     Ok(rows)
 }
 
-pub fn sort_rows(rows: &mut [Row]) {
-    rows.sort_unstable_by_key(|r| {
-        let snapshot = r.flags & SNAPSHOT != 0;
-        (
-            !snapshot,
-            if snapshot { 0 } else { r.publisher_id },
-            if snapshot { 0 } else { r.instrument_id },
-            if snapshot { 0 } else { r.channel_id },
-            if snapshot { 0 } else { r.sequence },
-            r.row_nr,
-        )
-    });
-}
-
 pub fn write_depth_parquet(
     rows: Vec<Row>,
     levels: usize,
     out: &str,
 ) -> Result<Stats, Box<dyn std::error::Error>> {
     let mut batches = BookBatchGenerator::new(rows.into_iter(), levels);
-    let props = WriterProperties::builder().build();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+        .build();
     let mut writer = ArrowWriter::try_new(File::create(out)?, batches.schema(), Some(props))?;
     for batch in batches.by_ref() {
         writer.write(&batch?)?;
@@ -195,8 +306,9 @@ pub struct BookBatchGenerator<I> {
     levels: usize,
     schema: Arc<Schema>,
     buf: OutBuffer,
-    books: HashMap<(u16, u32), Book>,
+    books: HashMap<(u16, u32), BookState>,
     stats: Stats,
+    prev_ts: i64,
     done: bool,
 }
 
@@ -210,6 +322,7 @@ impl<I: Iterator<Item = Row>> BookBatchGenerator<I> {
             buf: OutBuffer::new(levels, schema),
             books: HashMap::new(),
             stats: Stats::default(),
+            prev_ts: i64::MIN,
             done: false,
         }
     }
@@ -233,34 +346,84 @@ impl<I: Iterator<Item = Row>> BookBatchGenerator<I> {
             }
         }
         self.done = true;
+        self.flush_unterminated();
         self.buf.take_batch()
     }
 
     fn push_row(&mut self, row: Row) {
         self.stats.rows += 1;
-        let is_trade = row.action == b'T';
-        let top = {
-            let book = self
-                .books
-                .entry((row.publisher_id, row.instrument_id))
-                .or_default();
-            let before = if may_change(row.action) {
-                Some(book.top(self.levels))
-            } else {
-                None
-            };
-            if apply(book, row, &mut self.stats) {
-                let after = book.top(self.levels);
-                (before.as_ref() != Some(&after)).then_some((after, false))
-            } else if is_trade {
-                Some((book.top(self.levels), true))
-            } else {
-                None
-            }
+        if row.ts_event < self.prev_ts {
+            self.stats.ts_regressions += 1;
+        }
+        self.prev_ts = row.ts_event;
+        let key = (row.publisher_id, row.instrument_id);
+        let levels = self.levels;
+        let state = self
+            .books
+            .entry(key)
+            .or_insert_with(|| BookState::new(levels));
+        state.dirty = true;
+        state.last_meta = EmitMeta {
+            ts_event: row.ts_event,
+            row_nr: row.row_nr,
+            sequence: row.sequence,
         };
-        if let Some((top, is_trade)) = top {
-            self.buf.push(row, &top, is_trade);
-            self.stats.emitted += 1;
+        match row.action {
+            b'T' => {
+                self.stats.trades_or_fills += 1;
+                if row.side == b'N' {
+                    self.stats.sideless_trades += 1;
+                }
+                let agg = match state.pending.iter_mut().position(|a| a.side == row.side) {
+                    Some(i) => &mut state.pending[i],
+                    None => {
+                        state.pending.push(TradeAgg::new(&row));
+                        state.pending.last_mut().unwrap()
+                    }
+                };
+                agg.record_trade(&row);
+            }
+            b'F' => {
+                self.stats.trades_or_fills += 1;
+                if let Some(agg) = state
+                    .pending
+                    .iter_mut()
+                    .find(|a| a.side != row.side && a.side != b'N')
+                {
+                    agg.fills += 1;
+                }
+            }
+            b'N' => {
+                self.stats.trades_or_fills += 1;
+            }
+            _ => {
+                if row.action == b'A' && row.order_id != 0 {
+                    for agg in state.pending.iter_mut() {
+                        if agg.ids.contains(&row.order_id) {
+                            agg.posted += row.size as u64;
+                        }
+                    }
+                }
+                apply(&mut state.book, row, &mut self.stats);
+            }
+        }
+        if row.flags & F_LAST != 0 {
+            finalize_block(state, key, levels, &mut self.buf, &mut self.stats);
+        }
+    }
+
+    fn flush_unterminated(&mut self) {
+        let mut keys: Vec<_> = self
+            .books
+            .iter()
+            .filter(|(_, s)| s.dirty)
+            .map(|(k, s)| (s.last_meta.row_nr, *k))
+            .collect();
+        keys.sort_unstable();
+        for (_, key) in keys {
+            self.stats.unterminated_blocks += 1;
+            let state = self.books.get_mut(&key).unwrap();
+            finalize_block(state, key, self.levels, &mut self.buf, &mut self.stats);
         }
     }
 }
@@ -273,41 +436,94 @@ impl<I: Iterator<Item = Row>> Iterator for BookBatchGenerator<I> {
     }
 }
 
-fn apply(book: &mut Book, row: Row, stats: &mut Stats) -> bool {
-    match row.action {
-        b'T' | b'F' | b'N' => {
-            stats.trades_or_fills += 1;
-            false
+/// Close one instrument's F_LAST event block: emit the post-block top once
+/// per aggressor side present (trade columns per side, identical book
+/// columns), or a single row when only the book changed. Duplicate rows for
+/// earlier sides take their first T record's metadata so row_nr stays unique
+/// and points at the trade record in the raw MBO.
+fn finalize_block(
+    state: &mut BookState,
+    key: (u16, u32),
+    levels: usize,
+    buf: &mut OutBuffer,
+    stats: &mut Stats,
+) {
+    stats.blocks += 1;
+    let top = state.book.top(levels);
+    let changed = top != state.last_top;
+    if !state.pending.is_empty() {
+        stats.trade_blocks += 1;
+        if state.pending.len() > 1 {
+            stats.mixed_side_trade_blocks += 1;
         }
+        let n = state.pending.len();
+        for (i, agg) in state.pending.iter().enumerate() {
+            let meta = if i + 1 == n {
+                state.last_meta
+            } else {
+                EmitMeta {
+                    ts_event: agg.ts_event,
+                    row_nr: agg.row_nr,
+                    sequence: agg.sequence,
+                }
+            };
+            buf.push(meta, key, &top, Some(agg));
+            stats.emitted += 1;
+        }
+        state.pending.clear();
+    } else if changed {
+        buf.push(state.last_meta, key, &top, None);
+        stats.emitted += 1;
+    }
+    if changed {
+        state.last_top = top;
+    }
+    state.dirty = false;
+}
+
+fn apply(book: &mut Book, row: Row, stats: &mut Stats) {
+    match row.action {
         b'R' => {
             stats.clears += 1;
             book.orders.clear();
             book.bids.clear();
             book.asks.clear();
-            true
         }
         b'A' => {
             stats.adds += 1;
             if !valid_side(row.side) {
                 stats.bad_sides += 1;
-                return false;
+                return;
             }
-            if row.price == UNDEF_PRICE && row.flags & F_TOB != 0 {
-                side_levels_mut(book, row.side).clear();
-                return true;
+            if row.flags & F_TOB != 0 {
+                let levels = side_levels_mut(book, row.side);
+                levels.clear();
+                if row.price != UNDEF_PRICE && row.size > 0 {
+                    levels.insert(
+                        row.price,
+                        Level {
+                            size: row.size as u64,
+                            count: 1,
+                        },
+                    );
+                }
+                return;
+            }
+            if row.size == 0 {
+                stats.zero_size_adds += 1;
+                return;
             }
             if let Some(old) = book.orders.remove(&row.order_id) {
                 stats.duplicate_adds += 1;
                 remove_level_qty(book, old.side, old.price, old.size, true);
             }
             add_order(book, row.order_id, row.side, row.price, row.size);
-            true
         }
         b'C' => {
             stats.cancels += 1;
             let Some(mut order) = book.orders.get(&row.order_id).copied() else {
                 stats.missing_cancels += 1;
-                return false;
+                return;
             };
             let cancel_size = row.size.min(order.size);
             remove_level_qty(book, order.side, order.price, cancel_size, false);
@@ -318,13 +534,12 @@ fn apply(book: &mut Book, row: Row, stats: &mut Stats) -> bool {
             } else {
                 book.orders.insert(row.order_id, order);
             }
-            true
         }
         b'M' => {
             stats.modifies += 1;
             if !valid_side(row.side) {
                 stats.bad_sides += 1;
-                return false;
+                return;
             }
             if let Some(old) = book.orders.remove(&row.order_id) {
                 remove_level_qty(book, old.side, old.price, old.size, true);
@@ -332,11 +547,9 @@ fn apply(book: &mut Book, row: Row, stats: &mut Stats) -> bool {
                 stats.missing_modifies += 1;
             }
             add_order(book, row.order_id, row.side, row.price, row.size);
-            true
         }
         _ => {
             stats.unknown_actions += 1;
-            false
         }
     }
 }
@@ -374,7 +587,7 @@ where
 }
 
 fn add_order(book: &mut Book, order_id: u64, side: u8, price: i64, size: u32) {
-    if order_id == 0 || price == UNDEF_PRICE {
+    if order_id == 0 || price == UNDEF_PRICE || size == 0 {
         return;
     }
     book.orders.insert(order_id, Order { side, price, size });
@@ -405,10 +618,6 @@ fn side_levels_mut(book: &mut Book, side: u8) -> &mut BTreeMap<i64, Level> {
     }
 }
 
-fn may_change(action: u8) -> bool {
-    matches!(action, b'A' | b'C' | b'M' | b'R')
-}
-
 fn valid_side(side: u8) -> bool {
     side == b'A' || side == b'B'
 }
@@ -424,6 +633,11 @@ struct OutBuffer {
     trade_px: Vec<Option<i64>>,
     trade_sz: Vec<Option<u32>>,
     trade_side: Vec<Option<u8>>,
+    trade_px_last: Vec<Option<i64>>,
+    trade_vwap: Vec<Option<f64>>,
+    trade_levels: Vec<Option<u32>>,
+    trade_fills: Vec<Option<u32>>,
+    trade_posted_sz: Vec<Option<u32>>,
     bid_px: Vec<Vec<i64>>,
     bid_sz: Vec<Vec<u64>>,
     bid_ct: Vec<Vec<u32>>,
@@ -445,6 +659,11 @@ impl OutBuffer {
             trade_px: Vec::with_capacity(BATCH),
             trade_sz: Vec::with_capacity(BATCH),
             trade_side: Vec::with_capacity(BATCH),
+            trade_px_last: Vec::with_capacity(BATCH),
+            trade_vwap: Vec::with_capacity(BATCH),
+            trade_levels: Vec::with_capacity(BATCH),
+            trade_fills: Vec::with_capacity(BATCH),
+            trade_posted_sz: Vec::with_capacity(BATCH),
             bid_px: vec_cols(levels),
             bid_sz: vec_cols(levels),
             bid_ct: vec_cols(levels),
@@ -458,17 +677,22 @@ impl OutBuffer {
         self.row_nr.len()
     }
 
-    fn push(&mut self, row: Row, top: &Top, is_trade: bool) {
-        self.ts_event.push(row.ts_event);
-        self.row_nr.push(row.row_nr);
-        self.sequence.push(row.sequence);
-        self.publisher_id.push(row.publisher_id);
-        self.instrument_id.push(row.instrument_id);
-        self.trade_px
-            .push((is_trade && row.price != UNDEF_PRICE).then_some(row.price));
-        self.trade_sz.push(is_trade.then_some(row.size));
-        self.trade_side
-            .push(if is_trade { side_code(row.side) } else { None });
+    fn push(&mut self, meta: EmitMeta, key: (u16, u32), top: &Top, trade: Option<&TradeAgg>) {
+        self.ts_event.push(meta.ts_event);
+        self.row_nr.push(meta.row_nr);
+        self.sequence.push(meta.sequence);
+        self.publisher_id.push(key.0);
+        self.instrument_id.push(key.1);
+        self.trade_px.push(trade.and_then(|t| t.px_best()));
+        self.trade_sz
+            .push(trade.map(|t| t.qty.min(u32::MAX as u64) as u32));
+        self.trade_side.push(trade.and_then(|t| side_code(t.side)));
+        self.trade_px_last.push(trade.and_then(|t| t.px_worst()));
+        self.trade_vwap.push(trade.and_then(|t| t.vwap()));
+        self.trade_levels.push(trade.map(|t| t.levels));
+        self.trade_fills.push(trade.map(|t| t.fills));
+        self.trade_posted_sz
+            .push(trade.map(|t| t.posted.min(u32::MAX as u64) as u32));
         for i in 0..self.levels {
             self.bid_px[i].push(top.bids[i].price);
             self.bid_sz[i].push(top.bids[i].size);
@@ -495,6 +719,13 @@ impl OutBuffer {
             Arc::new(Int64Array::from(std::mem::take(&mut self.trade_px))),
             Arc::new(UInt32Array::from(std::mem::take(&mut self.trade_sz))),
             Arc::new(UInt8Array::from(std::mem::take(&mut self.trade_side))),
+            Arc::new(Int64Array::from(std::mem::take(&mut self.trade_px_last))),
+            Arc::new(Float64Array::from(std::mem::take(&mut self.trade_vwap))),
+            Arc::new(UInt32Array::from(std::mem::take(&mut self.trade_levels))),
+            Arc::new(UInt32Array::from(std::mem::take(&mut self.trade_fills))),
+            Arc::new(UInt32Array::from(std::mem::take(
+                &mut self.trade_posted_sz,
+            ))),
         ];
         for i in 0..self.levels {
             cols.push(Arc::new(Int64Array::from(std::mem::take(
@@ -530,6 +761,11 @@ impl OutBuffer {
         self.trade_px = Vec::with_capacity(BATCH);
         self.trade_sz = Vec::with_capacity(BATCH);
         self.trade_side = Vec::with_capacity(BATCH);
+        self.trade_px_last = Vec::with_capacity(BATCH);
+        self.trade_vwap = Vec::with_capacity(BATCH);
+        self.trade_levels = Vec::with_capacity(BATCH);
+        self.trade_fills = Vec::with_capacity(BATCH);
+        self.trade_posted_sz = Vec::with_capacity(BATCH);
         reserve_cols(&mut self.bid_px);
         reserve_cols(&mut self.bid_sz);
         reserve_cols(&mut self.bid_ct);
@@ -563,6 +799,11 @@ fn schema(levels: usize) -> Schema {
         Field::new("trade_px", DataType::Int64, true),
         Field::new("trade_sz", DataType::UInt32, true),
         Field::new("trade_side", DataType::UInt8, true),
+        Field::new("trade_px_last", DataType::Int64, true),
+        Field::new("trade_vwap", DataType::Float64, true),
+        Field::new("trade_levels", DataType::UInt32, true),
+        Field::new("trade_fills", DataType::UInt32, true),
+        Field::new("trade_posted_sz", DataType::UInt32, true),
     ];
     for i in 0..levels {
         fields.push(Field::new(format!("bid_px_{i}"), DataType::Int64, false));

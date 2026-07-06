@@ -1,9 +1,7 @@
 use std::env;
 use std::io;
 
-use orderbook_rs::{
-    read_rows_ipc, read_rows_parquet, sort_rows, write_depth_ipc, write_depth_parquet, Stats,
-};
+use orderbook_rs::{read_rows_ipc, read_rows_parquet, write_depth_ipc, write_depth_parquet, Stats};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
@@ -11,12 +9,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
     let format = value(&args, "--format").unwrap_or_else(|| "parquet".to_string());
-    let mut rows = if has(&args, "--input-ipc") {
+    let rows = if has(&args, "--input-ipc") {
         read_rows_ipc(io::stdin().lock())?
     } else {
         read_rows_parquet(input_path(&args).ok_or("missing input parquet path")?)?
     };
-    sort_rows(&mut rows);
 
     let stats = match format.as_str() {
         "ipc" | "arrow" => write_depth_ipc(rows, levels, io::stdout().lock())?,
@@ -32,12 +29,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_stats(s: &Stats) {
     eprintln!(
-        "rows={} emitted={} add={} cancel={} modify={} clear={} trade_or_fill={}",
-        s.rows, s.emitted, s.adds, s.cancels, s.modifies, s.clears, s.trades_or_fills
+        "rows={} blocks={} emitted={} trade_blocks={} add={} cancel={} modify={} clear={} trade_or_fill={}",
+        s.rows, s.blocks, s.emitted, s.trade_blocks, s.adds, s.cancels, s.modifies, s.clears,
+        s.trades_or_fills
     );
     eprintln!(
-        "warnings missing_cancels={} missing_modifies={} duplicate_adds={} bad_sides={} unknown_actions={}",
-        s.missing_cancels, s.missing_modifies, s.duplicate_adds, s.bad_sides, s.unknown_actions
+        "warnings missing_cancels={} missing_modifies={} duplicate_adds={} bad_sides={} unknown_actions={} \
+         mixed_side_trade_blocks={} sideless_trades={} zero_size_adds={} unterminated_blocks={} ts_regressions={}",
+        s.missing_cancels,
+        s.missing_modifies,
+        s.duplicate_adds,
+        s.bad_sides,
+        s.unknown_actions,
+        s.mixed_side_trade_blocks,
+        s.sideless_trades,
+        s.zero_size_adds,
+        s.unterminated_blocks,
+        s.ts_regressions
     );
 }
 

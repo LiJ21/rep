@@ -192,9 +192,7 @@ def plot_train_val_loss(
         if not isinstance(value, Mapping):
             return False
         nested = value.get("history")
-        return isinstance(nested, Mapping) and isinstance(
-            nested.get("train"), Mapping
-        )
+        return isinstance(nested, Mapping) and isinstance(nested.get("train"), Mapping)
 
     def sequence_value(value: Any) -> bool:
         return isinstance(value, Sequence) and not isinstance(
@@ -516,11 +514,11 @@ plot_validation_history = plot_train_val_loss
 @dataclass
 class Pipeline:
     rolling_dates: list[list[str]]
-    test_dates: list[str]
     adapter: Any
     target: str
     features: list[str]
     data_loader: Loader
+    test_dates: list[str] | None = None
     search_space: SearchSpace | ParamFn | None = None
     val_score: Score = rmse
     score_direction: str = "minimize"
@@ -732,14 +730,24 @@ class Pipeline:
             self.tracker.finish()
 
     def test(
-        self, score: Score = rmse, keep_predictions: bool = True
+        self,
+        score: Score = rmse,
+        keep_predictions: bool = True,
+        dates: list[str] | None = None,
+        filters: tuple[pl.Expr, ...] | None = None,
     ) -> dict[str, Any]:
         if self.model is None:
             raise RuntimeError("call train() and refit() before test()")
         transform = self.fitted_transform or self._fit_transform(
             self._all_train_dates()
         )
-        src = self._src(self.test_dates, self.test_filters, transform, "test")
+        dates = self.test_dates if dates is None else dates
+        if dates is None:
+            raise ValueError(
+                "Test dates not specified either as pipeline parameter nor test function argument."
+            )
+        filters = self.test_filters if filters is None else filters
+        src = self._src(dates, filters, transform, "test")
         loss, ctx, y_pred = self._evaluate(
             self.model, src, score, "test", keep_predictions=keep_predictions
         )
@@ -780,7 +788,9 @@ class Pipeline:
         model_meta["path"] = f"model/{model_meta['artifact']}"
 
         transform_path = root / "transform" / f"transform_{run_hash}.pkl"
-        transform_meta = save_transform(self.fitted_transform or self.transform, transform_path)
+        transform_meta = save_transform(
+            self.fitted_transform or self.transform, transform_path
+        )
         transform_meta["path"] = f"transform/{transform_path.name}"
 
         self.save_history(run_dir / "history.json")

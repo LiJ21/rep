@@ -40,6 +40,7 @@ def parse_args():
             "existing prices the original 13:15Z-20:05Z window"
         ),
     )
+    parser.add_argument("--symbol", action="append", help="Symbol to include, e.g. NQM6. Can be repeated")
     return parser.parse_args()
 
 
@@ -131,6 +132,7 @@ extra_es_normal = [
 ]
 
 extra_nq_transfer = [
+    "2026-03-23", "2026-03-24", "2026-03-25", "2026-03-26", "2026-03-27",
     "2026-03-30", "2026-03-31", "2026-04-01", "2026-04-02",
     "2026-04-06", "2026-04-07", "2026-04-08", "2026-04-09",
     "2026-04-27", "2026-04-28", "2026-04-30", "2026-05-01",
@@ -153,6 +155,9 @@ if start_date:
     requests = [r for r in requests if r[1] >= start_date]
 if end_date:
     requests = [r for r in requests if r[1] <= end_date]
+if args.symbol:
+    symbols = set(args.symbol)
+    requests = [r for r in requests if r[0] in symbols]
 if not requests:
     raise SystemExit("No configured requests match the selected date range")
 

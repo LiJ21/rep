@@ -1,0 +1,155 @@
+{
+  "adapter": {
+    "class": "XGBoostAdapter",
+    "module": "tools.model",
+    "repr": "XGBoostAdapter(num_boost_round=100, early_stopping_rounds=10, batch_size=200000, streaming=True, external_memory=False, cache_dir='/tmp/xgb_extmem', cache_prefix='xgb', release_data=True, xgb_dtype=<class 'numpy.float32'>, callbacks=[], pruning_metric='val-quantile', quantiles=[0.1, 0.5, 0.9])"
+  },
+  "best_params": {
+    "alpha": 0.10063396569448359,
+    "colsample_bytree": 0.7260619809088416,
+    "device": "cuda",
+    "eta": 0.15254868329123253,
+    "eval_metric": "quantile",
+    "lambda": 0.0013319751967982513,
+    "max_depth": 3,
+    "min_child_weight": 72.84706174508085,
+    "seed": 7,
+    "subsample": 0.6853541414319662,
+    "tree_method": "hist"
+  },
+  "created_at": "2026-07-03T22:33:12.694608+00:00",
+  "data_loader": {
+    "class": "function",
+    "module": "builtins",
+    "repr": "<function regular_loader at 0x7cd6dcf485e0>"
+  },
+  "feature_registry": {},
+  "features": [
+    "imb_d1",
+    "imb_d3",
+    "imb_d5",
+    "weighted_price_sz2",
+    "weighted_price_sz5",
+    "weighted_price_sz10",
+    "trade_momentum_hl1s",
+    "trade_momentum_hl10s",
+    "trade_momentum_hl30s",
+    "trade_momentum_hl120s"
+  ],
+  "filters": {
+    "test": [
+      {
+        "fingerprint": "deb3097a6d5b79705f6efc442dfefc7bf6d196a03189fdb113deaaf99a0436b5",
+        "name": "test_filter_0",
+        "version": 1
+      }
+    ],
+    "train": [
+      {
+        "fingerprint": "6c3449501c330b14e039e4d8e994426adb606ba469a3bc2cb8da53dbb559c56c",
+        "name": "train_filter_0",
+        "version": 1
+      }
+    ],
+    "val": [
+      {
+        "fingerprint": "6c3449501c330b14e039e4d8e994426adb606ba469a3bc2cb8da53dbb559c56c",
+        "name": "val_filter_0",
+        "version": 2
+      }
+    ]
+  },
+  "history": {
+    "path": "history.json"
+  },
+  "model": {
+    "artifact": "model_180683e4.ubj",
+    "format": "xgboost_ubj",
+    "path": "model/model_180683e4.ubj",
+    "sha256": "b681e9eab17c052aa52d0a7b4110636a4d8a3a2bb0879b609a6c9e2d501439ca"
+  },
+  "n_trials": 20,
+  "polars_engine": "streaming",
+  "registry": {
+    "path": "registry.jsonl"
+  },
+  "rolling_dates": [
+    [
+      "2026-03-23",
+      "2026-03-24",
+      "2026-03-25",
+      "2026-03-26",
+      "2026-03-27",
+      "2026-03-30",
+      "2026-03-31",
+      "2026-04-01",
+      "2026-04-02",
+      "2026-04-06",
+      "2026-04-07",
+      "2026-04-08",
+      "2026-04-09"
+    ],
+    [
+      "2026-04-10",
+      "2026-04-13",
+      "2026-04-14",
+      "2026-04-15",
+      "2026-04-16",
+      "2026-04-17",
+      "2026-04-20",
+      "2026-04-21",
+      "2026-04-22",
+      "2026-04-23",
+      "2026-04-24"
+    ],
+    [
+      "2026-04-27",
+      "2026-04-28",
+      "2026-04-29",
+      "2026-04-30",
+      "2026-05-01",
+      "2026-05-04",
+      "2026-05-05",
+      "2026-05-06",
+      "2026-05-07",
+      "2026-05-08"
+    ],
+    [
+      "2026-05-11",
+      "2026-05-12",
+      "2026-05-13",
+      "2026-05-14",
+      "2026-05-15",
+      "2026-05-18",
+      "2026-05-19",
+      "2026-05-20",
+      "2026-05-21",
+      "2026-05-22"
+    ]
+  ],
+  "run": {
+    "hash": "180683e4",
+    "stamp": "20260703T2233"
+  },
+  "sampler": "random",
+  "score_direction": "minimize",
+  "target": "forward_mid_return_bps",
+  "test_dates": [
+    "2026-05-26",
+    "2026-05-27",
+    "2026-05-28",
+    "2026-05-29"
+  ],
+  "transform": {
+    "base_name": "passthrough",
+    "config": {
+      "type": "Passthrough"
+    },
+    "fingerprint": "c5c0957976c807395ee8c26acc80350a6f7fc35febbf3a8fc88f1eb4c09a6654",
+    "format": "pickle",
+    "path": "transform/transform_180683e4.pkl",
+    "sha256": "821fc8baf6b4540e0b8ac9249edd3804f956de46685d784ffbd7ea63f971f0d6"
+  },
+  "val_score": "pinball_0.1_0.5_0.9",
+  "version": 2
+}

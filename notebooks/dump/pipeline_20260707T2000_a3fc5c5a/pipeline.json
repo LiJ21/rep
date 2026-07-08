@@ -1,0 +1,180 @@
+{
+  "adapter": {
+    "class": "XGBoostAdapter",
+    "module": "tools.model",
+    "repr": "XGBoostAdapter(num_boost_round=499, early_stopping_rounds=10, batch_size=1000000, streaming=True, external_memory=False, cache_dir='/tmp/xgb_extmem', cache_prefix='xgb', release_data=True, xgb_dtype=<class 'numpy.float32'>, callbacks=[], pruning_metric='val-quantile', quantiles=[0.1, 0.3, 0.5, 0.7, 0.9])"
+  },
+  "best_params": {
+    "alpha": 1.0439872157972168,
+    "colsample_bytree": 0.6342194900509356,
+    "device": "cuda",
+    "eta": 0.01,
+    "eval_metric": "quantile",
+    "lambda": 2.489716976425621,
+    "max_depth": 4,
+    "min_child_weight": 9.994590426751934,
+    "seed": 7,
+    "subsample": 0.6288204533439046,
+    "tree_method": "hist"
+  },
+  "created_at": "2026-07-07T20:00:36.471720+00:00",
+  "data_loader": {
+    "class": "function",
+    "module": "builtins",
+    "repr": "<function regular_loader at 0x7e57525222a0>"
+  },
+  "feature_registry": {},
+  "features": [
+    "imb_d1",
+    "imb_d3",
+    "imb_d5",
+    "weighted_price_sz2",
+    "weighted_price_sz5",
+    "weighted_price_sz10",
+    "trade_momentum_hl1s",
+    "push_momentum_hl1s",
+    "pull_momentum_hl1s",
+    "trade_corr_side_hl1s",
+    "trade_corr_volume_hl1s",
+    "log_return_hl1s",
+    "ewma_spread_hl1s",
+    "trade_momentum_hl10s",
+    "push_momentum_hl10s",
+    "pull_momentum_hl10s",
+    "trade_corr_side_hl10s",
+    "trade_corr_volume_hl10s",
+    "log_return_hl10s",
+    "ewma_spread_hl10s",
+    "trade_momentum_hl30s",
+    "push_momentum_hl30s",
+    "pull_momentum_hl30s",
+    "trade_corr_side_hl30s",
+    "trade_corr_volume_hl30s",
+    "log_return_hl30s",
+    "ewma_spread_hl30s",
+    "trade_momentum_hl120s",
+    "push_momentum_hl120s",
+    "pull_momentum_hl120s",
+    "trade_corr_side_hl120s",
+    "trade_corr_volume_hl120s",
+    "log_return_hl120s",
+    "ewma_spread_hl120s"
+  ],
+  "filters": {
+    "test": [
+      {
+        "fingerprint": "89ccf53d71d9cae45a0bfe103252c751d17ba8a373123be1953b20b03020c928",
+        "name": "test_filter_0",
+        "version": 2
+      }
+    ],
+    "train": [
+      {
+        "fingerprint": "e90ca5a986163f3fa0458d227caaeef0bc27f55c7f2ba49b2b6db640e4a0c3fa",
+        "name": "train_filter_0",
+        "version": 2
+      }
+    ],
+    "val": [
+      {
+        "fingerprint": "e90ca5a986163f3fa0458d227caaeef0bc27f55c7f2ba49b2b6db640e4a0c3fa",
+        "name": "val_filter_0",
+        "version": 3
+      }
+    ]
+  },
+  "history": {
+    "path": "history.json"
+  },
+  "model": {
+    "artifact": "model_a3fc5c5a.ubj",
+    "format": "xgboost_ubj",
+    "path": "model/model_a3fc5c5a.ubj",
+    "sha256": "88f80dd4aa8b15ba8f74513d2b8d441bfdbccb517cfd531f2d66fabeefd32d06"
+  },
+  "n_trials": 20,
+  "polars_engine": "streaming",
+  "refit_val_dates": null,
+  "registry": {
+    "path": "registry.jsonl"
+  },
+  "rolling_dates": [
+    [
+      "2026-03-23",
+      "2026-03-24",
+      "2026-03-25",
+      "2026-03-26",
+      "2026-03-27",
+      "2026-03-30",
+      "2026-03-31",
+      "2026-04-01",
+      "2026-04-02",
+      "2026-04-06",
+      "2026-04-07",
+      "2026-04-08",
+      "2026-04-09"
+    ],
+    [
+      "2026-04-10",
+      "2026-04-13",
+      "2026-04-14",
+      "2026-04-15",
+      "2026-04-16",
+      "2026-04-17",
+      "2026-04-20",
+      "2026-04-21",
+      "2026-04-22",
+      "2026-04-23",
+      "2026-04-24"
+    ],
+    [
+      "2026-04-27",
+      "2026-04-28",
+      "2026-04-29",
+      "2026-04-30",
+      "2026-05-01",
+      "2026-05-04",
+      "2026-05-05",
+      "2026-05-06",
+      "2026-05-07",
+      "2026-05-08"
+    ],
+    [
+      "2026-05-11",
+      "2026-05-12",
+      "2026-05-13",
+      "2026-05-14",
+      "2026-05-15",
+      "2026-05-18",
+      "2026-05-19",
+      "2026-05-20",
+      "2026-05-21",
+      "2026-05-22"
+    ]
+  ],
+  "run": {
+    "hash": "a3fc5c5a",
+    "stamp": "20260707T2000"
+  },
+  "sampler": "random",
+  "score_direction": "minimize",
+  "target": "forward_mid_return_bps",
+  "test_dates": [
+    "2026-05-26",
+    "2026-05-27",
+    "2026-05-28",
+    "2026-05-29"
+  ],
+  "transform": {
+    "base_name": "passthrough",
+    "config": {
+      "type": "Passthrough"
+    },
+    "fingerprint": "c5c0957976c807395ee8c26acc80350a6f7fc35febbf3a8fc88f1eb4c09a6654",
+    "format": "pickle",
+    "path": "transform/transform_a3fc5c5a.pkl",
+    "sha256": "821fc8baf6b4540e0b8ac9249edd3804f956de46685d784ffbd7ea63f971f0d6"
+  },
+  "val_score": "pinball_0.1_0.3_0.5_0.7_0.9",
+  "version": 2
+}

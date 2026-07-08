@@ -19,9 +19,14 @@ from typing import Any
 import numpy as np
 import polars as pl
 
-from tools.data import POLARS_ENGINES, DataSource, Loader
+from tools.data import POLARS_ENGINES, DataSource, Loader, Raw
 from tools.precision import check_precision
-from tools.registry import Registry
+from tools.registry import (
+    Registry,
+    file_set_manifest,
+    register_expr,
+    register_pickle_feature,
+)
 from tools.search import (
     BySizeRecency,
     ParamFn,
@@ -804,6 +809,7 @@ class Pipeline:
             )
         }
         features = self._register_features(registry, run_hash)
+        feature_files = self._feature_file_manifest()
 
         manifest = {
             "version": 2,
@@ -812,6 +818,7 @@ class Pipeline:
             "target": self.target,
             "features": list(self.features),
             "feature_registry": features,
+            "feature_files": feature_files,
             "rolling_dates": self.rolling_dates,
             "test_dates": self.test_dates,
             "best_params": self.best_params,
@@ -908,13 +915,37 @@ class Pipeline:
         self, registry: Registry, run_hash: str
     ) -> dict[str, dict[str, Any]]:
         exprs = _feature_exprs(self.data_loader)
+        stateful = _stateful_features(self.data_loader)
         refs: dict[str, dict[str, Any]] = {}
         for name in self.features:
             expr = exprs.get(name)
-            if expr is None:
+            if expr is not None:
+                refs[name] = register_expr(registry, "feature", name, expr, run_hash)
                 continue
-            refs[name] = _register_expr(registry, "feature", name, expr, run_hash)
+            feature = stateful.get(name)
+            if feature is not None:
+                refs[name] = register_pickle_feature(registry, name, feature, run_hash)
         return refs
+
+    def _feature_file_manifest(self) -> dict[str, Any]:
+        try:
+            paths = _loader_feature_files(self.data_loader, self._feature_file_dates())
+            return file_set_manifest(paths)
+        except Exception as exc:
+            return {
+                "algorithm": "sha256",
+                "hash": None,
+                "files": [],
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    def _feature_file_dates(self) -> list[str]:
+        dates = [date for chunk in self.rolling_dates for date in chunk]
+        if self.test_dates is not None:
+            dates.extend(self.test_dates)
+        if self.refit_val_dates is not None:
+            dates.extend(self.refit_val_dates)
+        return _ordered_unique(dates)
 
     def refit(
         self,
@@ -1155,22 +1186,7 @@ def _gb(n_bytes: int) -> float:
 def _register_expr(
     registry: Registry, kind: str, name: str, expr: pl.Expr, run_hash: str
 ) -> dict[str, Any]:
-    blob = expr.meta.serialize(format="json")
-    fingerprint = hashlib.sha256(blob.encode()).hexdigest()
-    entry = registry.register(
-        kind,
-        name,
-        fingerprint,
-        {
-            "expr": blob,
-            "repr": str(expr),
-            "roots": expr.meta.root_names(),
-            "format": "json",
-            "polars_version": pl.__version__,
-        },
-        run=run_hash,
-    )
-    return {"name": name, "version": entry["version"], "fingerprint": fingerprint}
+    return register_expr(registry, kind, name, expr, run_hash)
 
 
 def _exprs_from_refs(
@@ -1212,6 +1228,45 @@ def _feature_exprs(loader: Any) -> Mapping[str, pl.Expr]:
             return exprs
         loader = getattr(loader, "loader", None)
     return {}
+
+
+def _stateful_features(loader: Any) -> Mapping[str, Any]:
+    seen: set[int] = set()
+    while loader is not None and id(loader) not in seen:
+        seen.add(id(loader))
+        features = getattr(loader, "stateful_features", None)
+        if features:
+            return {feature.name: feature for feature in features}
+        loader = getattr(loader, "loader", None)
+    return {}
+
+
+def _loader_feature_files(loader: Any, dates: Sequence[str]) -> list[Path]:
+    seen: set[int] = set()
+    while loader is not None and id(loader) not in seen:
+        seen.add(id(loader))
+        files = getattr(loader, "feature_files", None)
+        if callable(files):
+            return _paths(files(list(dates)))
+        if files is not None:
+            return _paths(files)
+
+        path = getattr(loader, "path", None)
+        prod = getattr(loader, "prod", None)
+        if path is not None and prod is not None:
+            return [Path(Raw.resolve_path(date, prod, path)[0]) for date in dates]
+        if path is not None and Path(path).is_file():
+            return [Path(path)]
+        loader = getattr(loader, "loader", None)
+    return []
+
+
+def _paths(value: Any) -> list[Path]:
+    if value is None:
+        return []
+    if isinstance(value, (str, Path)):
+        return [Path(value)]
+    return [Path(path) for path in value]
 
 
 def _read_json(path: Path, default: Any | None = None) -> Any:

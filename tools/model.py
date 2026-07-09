@@ -272,6 +272,17 @@ class XGBoostAdapter(BaseAdapter):
                 x = np.asarray(x, dtype=self.xgb_dtype)
             return xgb.DMatrix(x, label=y)
 
+        if getattr(src, "is_shuffled", False):
+            raise ValueError(
+                "XGBoost streaming re-iterates the data source per pass and a "
+                "shuffled source yields a different stream each time; use an "
+                "unshuffled buffer config for XGBoost roles"
+            )
+        if self.external_memory and not getattr(src, "is_deterministic", True):
+            raise ValueError(
+                "external-memory XGBoost caches pages across iterations and "
+                "needs a deterministic stream; use workers=1 and no shuffle"
+            )
         batch_size = self.batch_size
         external_memory = self.external_memory
         if external_memory and not hasattr(xgb, "ExtMemQuantileDMatrix"):
@@ -1298,6 +1309,11 @@ class TorchAdapter(BaseAdapter):
         return model
 
     def _loader(self, torch: Any, src: "DataSource", rank: int, world_size: int):
+        if world_size > 1 and getattr(src, "is_shuffled", False):
+            raise ValueError(
+                "shuffled data sources cannot be sharded by batch index "
+                "across ranks; disable shuffle or train on a single process"
+            )
         batch_size = self.batch_size
 
         class SourceDataset(torch.utils.data.IterableDataset):

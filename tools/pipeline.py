@@ -541,6 +541,7 @@ class Pipeline:
     polars_engine: str = "streaming"
     precision: str = "float64"
     refit_val_dates: list[str] | None = None
+    data_source_wrapper: Callable[[DataSource, str], Any] | None = None
 
     model: Any = field(default=None, init=False)
     best_params: dict[str, Any] | None = field(default=None, init=False)
@@ -1048,9 +1049,9 @@ class Pipeline:
         filters: Sequence[pl.Expr],
         transform: Transform | None,
         role: str,
-    ) -> DataSource:
+    ) -> Any:
         key = (role, tuple(dates), id(transform), self.polars_engine, self.precision)
-        return DataSource(
+        src = DataSource(
             dates=list(dates),
             loader=self.data_loader,
             target=self.target,
@@ -1062,6 +1063,9 @@ class Pipeline:
             polars_engine=self.polars_engine,
             precision=self.precision,
         )
+        if self.data_source_wrapper is not None:
+            return self.data_source_wrapper(src, role)
+        return src
 
     def _fit_model(
         self,

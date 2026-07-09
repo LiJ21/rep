@@ -16,6 +16,7 @@ from tools.features_recipe import (
     EwmaFeature,
     ExprFeature,
     HalfLife,
+    _half_life_ns,
 )
 from tools.orderbook import depth_batches, depth_table_from_arrow
 from tools.precision import check_precision, float_dtype, float_lit
@@ -29,8 +30,10 @@ __all__ = [
     "CarryForwardFeature",
     "EwmaCarryover",
     "EwmaSpread",
+    "EwmaVar",
     "EwmaFeature",
     "ExprFeature",
+    "FlowReturnResponse",
     "LogReturn",
     "PullMomentum",
     "PushMomentum",
@@ -476,6 +479,111 @@ class LOBFeatures:
                 "precision": self.precision,
             }
 
+    @dataclass(frozen=True, init=False)
+    class FlowReturnResponse(ExprFeature):
+        form: str
+        mode: str
+        inner_half_life: HalfLife
+        outer_half_life: HalfLife
+        momentum_log: bool
+        time: str
+        eps: float
+        precision: str
+
+        def __init__(
+            self,
+            name: str,
+            inner_half_life: HalfLife,
+            outer_half_life: HalfLife,
+            form: str = "corr",
+            mode: str = "trade",
+            momentum_log: bool = False,
+            time: str = "ts_event",
+            eps: float = 1e-12,
+            precision: str = "float64",
+        ) -> None:
+            form = LOBFeatures._check_flow_response_form(form)
+            mode = LOBFeatures._check_momentum_mode(mode)
+            precision = check_precision(precision)
+            LOBFeatures._check_flow_response_half_lives(
+                inner_half_life, outer_half_life
+            )
+            momentum = LOBFeatures.BuySellMomentum(
+                f"__{name}_mom",
+                inner_half_life,
+                mode=mode,
+                log=momentum_log,
+                eps=eps,
+                time=time,
+                normalized=False,
+                precision=precision,
+            )
+            momentum_prev = CarryForwardFeature(
+                name=f"__{name}_mom_prev",
+                expr=pl.col(momentum.name),
+                precision=precision,
+            )
+            log_return = LOBFeatures._log_mid_return(precision) * float_lit(
+                1e4, precision
+            )
+            numerator = EwmaFeature(
+                name=f"__{name}_num",
+                expr=pl.col(momentum_prev.name) * log_return,
+                half_life=outer_half_life,
+                time=time,
+                normalized=False,
+                precision=precision,
+            )
+            sub_features: tuple[Any, ...] = (momentum, momentum_prev, numerator)
+            if form == "corr":
+                denominator = EwmaFeature(
+                    name=f"__{name}_denom",
+                    expr=log_return.abs(),
+                    half_life=outer_half_life,
+                    time=time,
+                    normalized=False,
+                    precision=precision,
+                )
+                sub_features = (*sub_features, denominator)
+                expr = (
+                    pl.when(pl.col(denominator.name) > float_lit(eps, precision))
+                    .then(pl.col(numerator.name) / pl.col(denominator.name))
+                    .otherwise(None)
+                    .cast(float_dtype(precision))
+                )
+            else:
+                expr = pl.col(numerator.name).cast(float_dtype(precision))
+
+            object.__setattr__(self, "name", name)
+            object.__setattr__(self, "expr", expr)
+            object.__setattr__(self, "sub_features", sub_features)
+            object.__setattr__(self, "form", form)
+            object.__setattr__(self, "mode", mode)
+            object.__setattr__(self, "inner_half_life", inner_half_life)
+            object.__setattr__(self, "outer_half_life", outer_half_life)
+            object.__setattr__(self, "momentum_log", momentum_log)
+            object.__setattr__(self, "time", time)
+            object.__setattr__(self, "eps", eps)
+            object.__setattr__(self, "precision", precision)
+            self._validate_tree()
+
+        def to_config(self) -> dict[str, Any]:
+            return {
+                **super().to_config(),
+                "form": self.form,
+                "mode": self.mode,
+                "inner_half_life": LOBFeatures._json_ready_half_life(
+                    self.inner_half_life
+                ),
+                "outer_half_life": LOBFeatures._json_ready_half_life(
+                    self.outer_half_life
+                ),
+                "momentum_log": self.momentum_log,
+                "time": self.time,
+                "eps": self.eps,
+                "precision": self.precision,
+            }
+
     class LogReturn(EwmaFeature):
         def __init__(
             self,
@@ -486,9 +594,7 @@ class LOBFeatures:
             precision: str = "float64",
         ) -> None:
             precision = check_precision(precision)
-            valid = LOBFeatures._bbo_valid(precision)
-            mid = pl.when(valid).then(LOBFeatures._mid(precision)).otherwise(None)
-            expr = (mid / mid.shift(1)).log() * float_lit(1e4, precision)
+            expr = LOBFeatures._log_mid_return(precision) * float_lit(1e4, precision)
             super().__init__(
                 name=name,
                 expr=expr,
@@ -497,6 +603,54 @@ class LOBFeatures:
                 normalized=normalized,
                 precision=precision,
             )
+
+    @dataclass(frozen=True, init=False)
+    class EwmaVar(ExprFeature):
+        half_life: HalfLife
+        time: str
+        normalized: bool
+        precision: str
+
+        def __init__(
+            self,
+            name: str,
+            half_life: HalfLife,
+            time: str = "ts_event",
+            normalized: bool = False,
+            precision: str = "float64",
+        ) -> None:
+            precision = check_precision(precision)
+            log_return = LOBFeatures._log_mid_return(precision)
+            variance = EwmaFeature(
+                name=f"__ewma_{name}_var",
+                expr=log_return * log_return,
+                half_life=half_life,
+                time=time,
+                normalized=normalized,
+                precision=precision,
+            )
+            expr = (
+                pl.col(variance.name).sqrt() * float_lit(1e4, precision)
+            ).cast(float_dtype(precision))
+
+            object.__setattr__(self, "name", name)
+            object.__setattr__(self, "expr", expr)
+            object.__setattr__(self, "sub_features", (variance,))
+            object.__setattr__(self, "half_life", half_life)
+            object.__setattr__(self, "time", time)
+            object.__setattr__(self, "normalized", normalized)
+            object.__setattr__(self, "precision", precision)
+            self._validate_tree()
+
+        def to_config(self) -> dict[str, Any]:
+            return {
+                **super().to_config(),
+                "half_life": LOBFeatures._json_ready_half_life(self.half_life),
+                "time": self.time,
+                "normalized": self.normalized,
+                "precision": self.precision,
+                "output": "sqrt_bps",
+            }
 
     class EwmaSpread(EwmaFeature):
         def __init__(
@@ -569,6 +723,12 @@ class LOBFeatures:
         return (LOBFeatures._bid0(precision) + LOBFeatures._ask0(precision)) / float_lit(
             2.0, precision
         )
+
+    @staticmethod
+    def _log_mid_return(precision: str = "float64") -> pl.Expr:
+        valid = LOBFeatures._bbo_valid(precision)
+        mid = pl.when(valid).then(LOBFeatures._mid(precision)).otherwise(None)
+        return (mid / mid.shift(1)).log()
 
     @staticmethod
     def _bbo_vol(precision: str = "float64") -> pl.Expr:
@@ -670,6 +830,21 @@ class LOBFeatures:
         if mode not in {"side", "volume"}:
             raise ValueError("trade correlation mode must be one of: 'side', 'volume'")
         return mode
+
+    @staticmethod
+    def _check_flow_response_form(form: str) -> str:
+        if form not in {"sum", "corr"}:
+            raise ValueError("flow response form must be one of: 'sum', 'corr'")
+        return form
+
+    @staticmethod
+    def _check_flow_response_half_lives(
+        inner_half_life: HalfLife, outer_half_life: HalfLife
+    ) -> None:
+        if _half_life_ns(outer_half_life) < 10 * _half_life_ns(inner_half_life):
+            raise ValueError(
+                "flow response outer_half_life must be at least 10x inner_half_life"
+            )
 
     @staticmethod
     def _momentum_inputs(
@@ -814,6 +989,8 @@ class LOBFeatures:
 
 BuySellMomentum = LOBFeatures.BuySellMomentum
 EwmaSpread = LOBFeatures.EwmaSpread
+EwmaVar = LOBFeatures.EwmaVar
+FlowReturnResponse = LOBFeatures.FlowReturnResponse
 LogReturn = LOBFeatures.LogReturn
 PullMomentum = LOBFeatures.PullMomentum
 PushMomentum = LOBFeatures.PushMomentum

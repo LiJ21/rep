@@ -12,7 +12,7 @@ import numpy as np
 import polars as pl
 
 POLARS_ENGINES = {"auto", "streaming", "gpu"}
-SERIES_KINDS = {"level", "event"}
+SERIES_KINDS = {"level", "line", "event"}
 _X_HOVER_COL = "__viewer_x_hover"
 _X_NS_COL = "__viewer_x_ns"
 _X_PLOT_COL = "__viewer_x_plot"
@@ -397,6 +397,18 @@ class DataViewer:
                         "symbol": series.point_symbol,
                         "size": series.point_size,
                         "color": series.color,
+                    }
+                ),
+                **_drop_none(common),
+            )
+        elif series.kind == "line":
+            trace = go.Scatter(
+                mode="lines",
+                line=_drop_none(
+                    {
+                        "shape": "linear",
+                        "color": series.color,
+                        "width": series.line_width,
                     }
                 ),
                 **_drop_none(common),
@@ -1044,6 +1056,9 @@ def _resample_indices(
         return []
     if kind == "level":
         return _level_indices(y_values, max_points)
+    # Continuous lines and point events are decimated uniformly. For lines this
+    # depends only on row count and budget, keeping same-length signal columns
+    # aligned even though each trace is constructed independently.
     return _uniform_indices(n, max_points)
 
 

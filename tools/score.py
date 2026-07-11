@@ -34,6 +34,48 @@ def rmse(
     return ScoreValue(float(np.sqrt(sse / n)) if n else 0.0, n, {"sse": sse})
 
 
+def weighted_rmse(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    ctx: dict[str, Any] | None = None,
+    sample_weight: np.ndarray | None = None,
+    combine_with: Any = _NO_COMBINE,
+) -> float | ScoreValue:
+    err = np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float)
+    if sample_weight is None:
+        weight = np.ones(len(err), dtype=float)
+    else:
+        weight = np.asarray(sample_weight, dtype=float)
+        if weight.ndim != 1 or len(weight) != len(err):
+            raise ValueError(
+                "sample weight must be one-dimensional and match y_true"
+            )
+        if not np.all(np.isfinite(weight)) or np.any(weight < 0):
+            raise ValueError("sample weight must be finite and nonnegative")
+    sse = float(np.dot(weight, err * err))
+    weight_sum = float(weight.sum())
+    n = int(len(err))
+    if combine_with is not _NO_COMBINE and combine_with is not None:
+        state = getattr(combine_with, "state", {})
+        sse += float(state.get("sse", 0.0))
+        weight_sum += float(
+            state.get("weight_sum", getattr(combine_with, "n", 0))
+        )
+        n += int(getattr(combine_with, "n", 0))
+    value = float(np.sqrt(sse / weight_sum)) if weight_sum else 0.0
+    if combine_with is _NO_COMBINE:
+        return value
+    return ScoreValue(value, n, {"sse": sse, "weight_sum": weight_sum})
+
+
+def weighted(score: Score) -> Score:
+    if score is rmse:
+        return weighted_rmse
+    raise ValueError(
+        f"no weighted implementation registered for {getattr(score, '__name__', score)!r}"
+    )
+
+
 def r2(
     y_true: np.ndarray,
     y_pred: np.ndarray,

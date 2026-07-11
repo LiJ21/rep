@@ -409,9 +409,7 @@ class LOBFeatures:
             )
             m_vv = EwmaFeature(
                 name=f"__ewma_{name}_vv",
-                expr=pl.when(pair)
-                .then(pl.col(v_prev.name) * value)
-                .otherwise(None),
+                expr=pl.when(pair).then(pl.col(v_prev.name) * value).otherwise(None),
                 half_life=half_life,
                 time=time,
                 normalized=True,
@@ -629,9 +627,9 @@ class LOBFeatures:
                 normalized=normalized,
                 precision=precision,
             )
-            expr = (
-                pl.col(variance.name).sqrt() * float_lit(1e4, precision)
-            ).cast(float_dtype(precision))
+            expr = (pl.col(variance.name).sqrt() * float_lit(1e4, precision)).cast(
+                float_dtype(precision)
+            )
 
             object.__setattr__(self, "name", name)
             object.__setattr__(self, "expr", expr)
@@ -720,9 +718,9 @@ class LOBFeatures:
 
     @staticmethod
     def _mid(precision: str = "float64") -> pl.Expr:
-        return (LOBFeatures._bid0(precision) + LOBFeatures._ask0(precision)) / float_lit(
-            2.0, precision
-        )
+        return (
+            LOBFeatures._bid0(precision) + LOBFeatures._ask0(precision)
+        ) / float_lit(2.0, precision)
 
     @staticmethod
     def _log_mid_return(precision: str = "float64") -> pl.Expr:
@@ -843,7 +841,7 @@ class LOBFeatures:
     ) -> None:
         if _half_life_ns(outer_half_life) < 10 * _half_life_ns(inner_half_life):
             raise ValueError(
-                "flow response outer_half_life must be at least 10x inner_half_life"
+                f"flow response outer_half_life {outer_half_life} must be at least 10x inner_half_life {inner_half_life}"
             )
 
     @staticmethod
@@ -890,9 +888,7 @@ class LOBFeatures:
             .cast(float_dtype(precision))
             .fill_null(float_lit(0.0, precision))
         )
-        return (pl.col("trade_side").is_in([0, 1]) & (trade_size > 0)).fill_null(
-            False
-        )
+        return (pl.col("trade_side").is_in([0, 1]) & (trade_size > 0)).fill_null(False)
 
     @staticmethod
     def _trade_side_sign(precision: str) -> pl.Expr:
@@ -915,9 +911,7 @@ class LOBFeatures:
     @staticmethod
     def _book_push_input(side: str, unit: bool, precision: str) -> pl.Expr:
         px = LOBFeatures._px(side, 0, precision)
-        sz = LOBFeatures._sz(side, 0, precision).fill_null(
-            float_lit(0.0, precision)
-        )
+        sz = LOBFeatures._sz(side, 0, precision).fill_null(float_lit(0.0, precision))
         prev_px = px.shift(1)
         prev_sz = sz.shift(1).fill_null(float_lit(0.0, precision))
         diff = sz - prev_sz
@@ -938,9 +932,7 @@ class LOBFeatures:
     @staticmethod
     def _book_pull_input(side: str, unit: bool, precision: str) -> pl.Expr:
         px = LOBFeatures._px(side, 0, precision)
-        sz = LOBFeatures._sz(side, 0, precision).fill_null(
-            float_lit(0.0, precision)
-        )
+        sz = LOBFeatures._sz(side, 0, precision).fill_null(float_lit(0.0, precision))
         prev_px = px.shift(1)
         prev_sz = sz.shift(1).fill_null(float_lit(0.0, precision))
         diff = sz - prev_sz

@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 import polars as pl
 
-from tools.data import POLARS_ENGINES, DataSource, Loader, Raw
+from tools.data import POLARS_ENGINES, Batch, DataSource, Loader, Raw, as_batch
 from tools.precision import check_precision
 from tools.registry import (
     Registry,
@@ -50,12 +50,18 @@ def evaluate_model(
     keep_predictions: bool = False,
 ) -> tuple[float, dict[str, Any], np.ndarray | None]:
     if not getattr(adapter, "streaming", False):
-        x, y_true, ctx = src.materialize()
-        y_pred = adapter.predict(model, x)
-        ctx["fold"] = fold
+        batch = as_batch(src.materialize())
+        y_pred = adapter.predict(model, batch.x)
+        batch.ctx["fold"] = fold
         return (
-            score_arrays(score, y_true, y_pred, ctx),
-            ctx,
+            score_arrays(
+                score,
+                batch.y,
+                y_pred,
+                batch.ctx,
+                sample_weight=batch.weight,
+            ),
+            batch.ctx,
             y_pred if keep_predictions else None,
         )
     loss, ctx, y_pred = score_stream(adapter, model, score, src, keep_predictions)
@@ -68,12 +74,15 @@ def score_arrays(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     ctx: dict[str, Any],
+    sample_weight: np.ndarray | None = None,
 ) -> float:
     if len(y_true) != len(y_pred):
         raise ValueError(
             f"score length mismatch: y_true={len(y_true)}, y_pred={len(y_pred)}"
         )
-    return float(call_score(score, y_true, y_pred, ctx))
+    return float(
+        call_score(score, y_true, y_pred, ctx, sample_weight=sample_weight)
+    )
 
 
 def score_stream(
@@ -87,14 +96,22 @@ def score_stream(
     ctx: dict[str, Any] = {"n": 0}
     pred_parts = [] if keep_predictions else None
 
-    for x, y_true, batch_ctx in src.batches(adapter_batch_size(adapter)):
-        y_pred = np.asarray(adapter.predict(model, x))
-        if len(y_true) != len(y_pred):
+    for value in src.batches(adapter_batch_size(adapter)):
+        batch = as_batch(value)
+        y_pred = np.asarray(adapter.predict(model, batch.x))
+        if len(batch.y) != len(y_pred):
             raise ValueError(
-                f"score length mismatch: y_true={len(y_true)}, y_pred={len(y_pred)}"
+                f"score length mismatch: y_true={len(batch.y)}, y_pred={len(y_pred)}"
             )
-        state = call_score(score, y_true, y_pred, batch_ctx, combine_with=state)
-        merge_ctx(ctx, batch_ctx)
+        state = call_score(
+            score,
+            batch.y,
+            y_pred,
+            batch.ctx,
+            combine_with=state,
+            sample_weight=batch.weight,
+        )
+        merge_ctx(ctx, batch.ctx)
         if pred_parts is not None:
             pred_parts.append(y_pred)
 
@@ -110,6 +127,7 @@ def call_score(
     y_pred: np.ndarray,
     ctx: dict[str, Any],
     combine_with: Any = _NO_COMBINE,
+    sample_weight: np.ndarray | None = None,
 ) -> Any:
     sig = inspect.signature(score)
     params = list(sig.parameters.values())
@@ -120,10 +138,15 @@ def call_score(
     ]
     args: list[Any] = [y_true, y_pred]
     kwargs: dict[str, Any] = {}
-    if has_varargs or (len(positional) >= 3 and positional[2].name != "combine_with"):
+    if has_varargs or (
+        len(positional) >= 3
+        and positional[2].name not in {"combine_with", "sample_weight"}
+    ):
         args.append(ctx)
     elif "ctx" in sig.parameters:
         kwargs["ctx"] = ctx
+    if sample_weight is not None and "sample_weight" in sig.parameters:
+        kwargs["sample_weight"] = sample_weight
     if combine_with is not _NO_COMBINE:
         if "combine_with" not in sig.parameters and not has_varkw:
             raise TypeError("streaming scores must accept a combine_with argument")
@@ -542,6 +565,7 @@ class Pipeline:
     precision: str = "float64"
     refit_val_dates: list[str] | None = None
     data_source_wrapper: Callable[[DataSource, str], Any] | None = None
+    sample_weight_col: str | None = None
 
     model: Any = field(default=None, init=False)
     best_params: dict[str, Any] | None = field(default=None, init=False)
@@ -558,6 +582,8 @@ class Pipeline:
         if self.polars_engine not in POLARS_ENGINES:
             raise ValueError(f"polars_engine must be one of: {sorted(POLARS_ENGINES)}")
         self.precision = check_precision(self.precision)
+        if self.sample_weight_col == "":
+            raise ValueError("sample_weight_col must be non-empty or None")
         self.train_filters = tuple(self.train_filters)
         self.val_filters = tuple(self.val_filters)
         self.test_filters = tuple(self.test_filters)
@@ -568,9 +594,7 @@ class Pipeline:
                 else list(self.refit_val_dates)
             )
         self._transform_cache: dict[tuple[Any, ...], Transform] = {}
-        self._array_cache: dict[
-            tuple[Any, ...], tuple[np.ndarray, np.ndarray, dict[str, Any]]
-        ] = {}
+        self._array_cache: dict[tuple[Any, ...], Batch] = {}
 
     def train(
         self,
@@ -813,11 +837,12 @@ class Pipeline:
         feature_files = self._feature_file_manifest()
 
         manifest = {
-            "version": 2,
+            "version": 3,
             "created_at": dt.datetime.now(dt.UTC).isoformat(),
             "run": {"stamp": stamp, "hash": run_hash},
             "target": self.target,
             "features": list(self.features),
+            "sample_weight_col": self.sample_weight_col,
             "feature_registry": features,
             "feature_files": feature_files,
             "rolling_dates": self.rolling_dates,
@@ -855,6 +880,7 @@ class Pipeline:
 
         self.target = manifest.get("target", self.target)
         self.features = list(manifest.get("features", self.features))
+        self.sample_weight_col = manifest.get("sample_weight_col")
         self.rolling_dates = [
             list(x) for x in manifest.get("rolling_dates", self.rolling_dates)
         ]
@@ -918,7 +944,10 @@ class Pipeline:
         exprs = _feature_exprs(self.data_loader)
         stateful = _stateful_features(self.data_loader)
         refs: dict[str, dict[str, Any]] = {}
-        for name in self.features:
+        names = [*self.features]
+        if self.sample_weight_col is not None:
+            names.append(self.sample_weight_col)
+        for name in _ordered_unique(names):
             expr = exprs.get(name)
             if expr is not None:
                 refs[name] = register_expr(registry, "feature", name, expr, run_hash)
@@ -1036,7 +1065,12 @@ class Pipeline:
         return self.model
 
     def _fit_transform(self, dates: Sequence[str]) -> Transform:
-        key = (tuple(dates), self.polars_engine, self.precision)
+        key = (
+            tuple(dates),
+            self.polars_engine,
+            self.precision,
+            self.sample_weight_col,
+        )
         if key not in self._transform_cache:
             src = self._src(dates, self.train_filters, None, "fit")
             transform = copy.deepcopy(self.transform)
@@ -1050,7 +1084,14 @@ class Pipeline:
         transform: Transform | None,
         role: str,
     ) -> Any:
-        key = (role, tuple(dates), id(transform), self.polars_engine, self.precision)
+        key = (
+            role,
+            tuple(dates),
+            id(transform),
+            self.polars_engine,
+            self.precision,
+            self.sample_weight_col,
+        )
         src = DataSource(
             dates=list(dates),
             loader=self.data_loader,
@@ -1058,6 +1099,7 @@ class Pipeline:
             features=self.features,
             filters=tuple(filters),
             transform=transform,
+            sample_weight_col=self.sample_weight_col,
             cache=self._array_cache if self.cache_arrays else None,
             cache_key=key,
             polars_engine=self.polars_engine,
@@ -1075,6 +1117,12 @@ class Pipeline:
         trial: Any | None,
         fit_context: dict[str, Any] | None = None,
     ) -> Any:
+        if self.sample_weight_col is not None and not getattr(
+            self.adapter, "supports_sample_weight", False
+        ):
+            raise TypeError(
+                f"{type(self.adapter).__name__} does not support sample weights"
+            )
         sig = inspect.signature(self.adapter.fit)
         accepts_kwargs = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
         kwargs: dict[str, Any] = {}
@@ -1126,6 +1174,7 @@ class Pipeline:
             "n_trials": n_trials,
             "n_folds": max(0, len(self.rolling_dates) - 1),
             "refit_val_dates": self.refit_val_dates,
+            "sample_weight_col": self.sample_weight_col,
             "validation_history": self.validation_history,
             "refit_history": self.refit_history,
         }

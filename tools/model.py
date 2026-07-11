@@ -7,9 +7,11 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Protocol, TYPE_CHECKING, runtime_checkable
+from typing import Any, ClassVar, Protocol, TYPE_CHECKING, runtime_checkable
 
 import numpy as np
+
+from tools.data import as_batch, validate_sample_weight
 
 if TYPE_CHECKING:
     from tools.data import DataSource
@@ -19,6 +21,7 @@ if TYPE_CHECKING:
 @runtime_checkable
 class ModelAdapter(Protocol):
     streaming: bool
+    supports_sample_weight: bool
 
     def build(self, params: dict[str, Any]) -> Any: ...
 
@@ -53,6 +56,8 @@ class ModelAdapter(Protocol):
 
 
 class BaseAdapter:
+    supports_sample_weight: ClassVar[bool] = False
+
     def save_model(
         self, model: Any, path: str | Path, filename: str | None = None
     ) -> dict[str, Any]:
@@ -93,6 +98,7 @@ class BaseAdapter:
 class DummyAdapter(BaseAdapter):
     mode: str = "mean"
     streaming: bool = False
+    supports_sample_weight: ClassVar[bool] = True
 
     def build(self, params: dict[str, Any]) -> dict[str, Any]:
         return {"params": dict(params)}
@@ -106,13 +112,22 @@ class DummyAdapter(BaseAdapter):
         trial: Any | None = None,
         fit_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        x, y, _ = train.materialize()
+        batch = as_batch(train.materialize())
+        x, y, weight = batch.x, batch.y, batch.weight
         if self.mode == "linear" and x.size:
             design = np.c_[np.ones(len(x)), x]
+            if weight is not None:
+                root_weight = np.sqrt(np.asarray(weight, dtype=float))
+                design = design * root_weight[:, None]
+                y = np.asarray(y) * root_weight
             coef, *_ = np.linalg.lstsq(design, y, rcond=None)
             model.update({"intercept": coef[0], "coef": coef[1:]})
         else:
-            model["mean"] = float(np.mean(y)) if len(y) else 0.0
+            model["mean"] = (
+                float(np.average(y, weights=weight))
+                if len(y) and weight is not None
+                else float(np.mean(y)) if len(y) else 0.0
+            )
         return model
 
     def predict(self, model: dict[str, Any], x: np.ndarray) -> np.ndarray:
@@ -127,6 +142,7 @@ class XGBoostAdapter(BaseAdapter):
     early_stopping_rounds: int | None = None
     batch_size: int | None = 200_000
     streaming: bool = True
+    supports_sample_weight: ClassVar[bool] = True
     external_memory: bool = False
     cache_dir: str | Path = "/tmp/xgb_extmem"
     cache_prefix: str = "xgb"
@@ -267,10 +283,14 @@ class XGBoostAdapter(BaseAdapter):
                 raise ValueError(
                     "XGBoostAdapter external_memory=True requires streaming=True"
                 )
-            x, y, _ = src.materialize()
+            batch = as_batch(src.materialize())
+            x, y = batch.x, batch.y
             if self.xgb_dtype is not None:
                 x = np.asarray(x, dtype=self.xgb_dtype)
-            return xgb.DMatrix(x, label=y)
+            kwargs = {"label": y}
+            if batch.weight is not None:
+                kwargs["weight"] = batch.weight
+            return xgb.DMatrix(x, **kwargs)
 
         if getattr(src, "is_shuffled", False):
             raise ValueError(
@@ -310,12 +330,16 @@ class XGBoostAdapter(BaseAdapter):
 
             def next(self, input_data):
                 try:
-                    x, y, _ = next(self._iter)
+                    batch = as_batch(next(self._iter))
                 except StopIteration:
                     return 0
+                x, y = batch.x, batch.y
                 if xgb_dtype is not None:
                     x = np.asarray(x, dtype=xgb_dtype)
-                input_data(data=x, label=y)
+                kwargs = {"data": x, "label": y}
+                if batch.weight is not None:
+                    kwargs["weight"] = batch.weight
+                input_data(**kwargs)
                 return 1
 
         if external_memory:
@@ -491,6 +515,7 @@ class LarsAdapter(BaseAdapter):
     stats_backend: str = "cpu"
     stats_dtype: Any = np.float64
     streaming: bool = True
+    supports_sample_weight: ClassVar[bool] = True
     cache_path: bool = True
     vectorized_path_eval: bool = True
     path_eval_alphas: Sequence[float] | None = None
@@ -644,9 +669,10 @@ class LarsAdapter(BaseAdapter):
             return self._stats_cache[key]
 
         stats: _LinearStats | None = None
-        for x, y, _ in src.batches(self.batch_size):
-            x = np.asarray(x)
-            y = np.asarray(y).reshape(-1)
+        for value in src.batches(self.batch_size):
+            batch = as_batch(value)
+            x = np.asarray(batch.x)
+            y = np.asarray(batch.y).reshape(-1)
             if len(y) == 0:
                 continue
             if stats is None:
@@ -657,10 +683,12 @@ class LarsAdapter(BaseAdapter):
                 stats = _LinearStats.empty(
                     x.shape[1], self._stats_xp(), self.stats_dtype
                 )
-            stats.add(x, y)
+            stats.add(x, y, batch.weight)
 
         if stats is None or stats.n == 0:
             raise ValueError("cannot fit LarsAdapter on empty data")
+        if stats.weight_sum <= 0.0:
+            raise ValueError("cannot fit LarsAdapter with zero total sample weight")
         if key is not None:
             self._stats_cache[key] = stats
         return stats
@@ -673,6 +701,7 @@ class LarsAdapter(BaseAdapter):
             key,
             tuple(src.features),
             src.target,
+            getattr(src, "sample_weight_col", None),
             self.stats_backend,
             str(np.dtype(self.stats_dtype)),
         )
@@ -739,9 +768,10 @@ class LarsAdapter(BaseAdapter):
         states: list[Any] = [None] * len(alphas)
         ctx: dict[str, Any] = {"n": 0}
 
-        for x, y_true, batch_ctx in src.batches(self.batch_size):
-            x = np.asarray(x, dtype=float)
-            y_true = np.asarray(y_true)
+        for value in src.batches(self.batch_size):
+            batch = as_batch(value)
+            x = np.asarray(batch.x, dtype=float)
+            y_true = np.asarray(batch.y)
             preds = x @ coefs + intercepts
             if len(y_true) != preds.shape[0]:
                 raise ValueError(
@@ -752,10 +782,11 @@ class LarsAdapter(BaseAdapter):
                     score,
                     y_true,
                     preds[:, i],
-                    dict(batch_ctx),
+                    dict(batch.ctx),
                     combine_with=states[i],
+                    sample_weight=batch.weight,
                 )
-            merge_ctx(ctx, batch_ctx)
+            merge_ctx(ctx, batch.ctx)
 
         if any(state is None for state in states):
             raise ValueError("cannot score empty prediction stream")
@@ -830,6 +861,7 @@ class RidgeAdapter(BaseAdapter):
     stats_backend: str = "cpu"
     stats_dtype: Any = np.float64
     streaming: bool = True
+    supports_sample_weight: ClassVar[bool] = True
     cache_stats: bool = True
     _stats_cache: dict[Any, "_LinearStats"] = field(
         default_factory=dict, init=False, repr=False
@@ -884,9 +916,10 @@ class RidgeAdapter(BaseAdapter):
             return self._stats_cache[key]
 
         stats: _LinearStats | None = None
-        for x, y, _ in src.batches(self.batch_size):
-            x = np.asarray(x)
-            y = np.asarray(y).reshape(-1)
+        for value in src.batches(self.batch_size):
+            batch = as_batch(value)
+            x = np.asarray(batch.x)
+            y = np.asarray(batch.y).reshape(-1)
             if len(y) == 0:
                 continue
             if stats is None:
@@ -897,10 +930,12 @@ class RidgeAdapter(BaseAdapter):
                 stats = _LinearStats.empty(
                     x.shape[1], self._stats_xp(), self.stats_dtype
                 )
-            stats.add(x, y)
+            stats.add(x, y, batch.weight)
 
         if stats is None or stats.n == 0:
             raise ValueError("cannot fit RidgeAdapter on empty data")
+        if stats.weight_sum <= 0.0:
+            raise ValueError("cannot fit RidgeAdapter with zero total sample weight")
         if key is not None:
             self._stats_cache[key] = stats
         return stats
@@ -915,6 +950,7 @@ class RidgeAdapter(BaseAdapter):
             key,
             tuple(src.features),
             src.target,
+            getattr(src, "sample_weight_col", None),
             self.stats_backend,
             str(np.dtype(self.stats_dtype)),
         )
@@ -966,6 +1002,7 @@ class _LinearStats:
     xty: Any
     x_sum: Any
     y_sum: float = 0.0
+    weight_sum: float = 0.0
     n: int = 0
 
     @classmethod
@@ -985,7 +1022,12 @@ class _LinearStats:
     def n_features(self) -> int:
         return int(self.x_sum.size)
 
-    def add(self, x: np.ndarray, y: np.ndarray) -> None:
+    def add(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        sample_weight: np.ndarray | None = None,
+    ) -> None:
         if x.shape[0] != len(y):
             raise ValueError(f"batch length mismatch: X={x.shape[0]} y={len(y)}")
         if x.shape[1] != self.n_features:
@@ -994,10 +1036,22 @@ class _LinearStats:
             )
         x = self.xp.asarray(x, dtype=self.dtype)
         y = self.xp.asarray(y, dtype=self.dtype).reshape(-1)
-        self.xtx += x.T @ x
-        self.xty += x.T @ y
-        self.x_sum += x.sum(axis=0)
-        self.y_sum += float(self._cpu(y.sum()).item())
+        if sample_weight is None:
+            self.xtx += x.T @ x
+            self.xty += x.T @ y
+            self.x_sum += x.sum(axis=0)
+            self.y_sum += float(self._cpu(y.sum()).item())
+            self.weight_sum += len(y)
+        else:
+            validate_sample_weight(sample_weight, len(y))
+            weight = self.xp.asarray(sample_weight, dtype=self.dtype).reshape(-1)
+            weighted_x = x * weight[:, None]
+            weighted_y = y * weight
+            self.xtx += x.T @ weighted_x
+            self.xty += x.T @ weighted_y
+            self.x_sum += weighted_x.sum(axis=0)
+            self.y_sum += float(self._cpu(weighted_y.sum()).item())
+            self.weight_sum += float(self._cpu(weight.sum()).item())
         self.n += len(y)
 
     def centered(
@@ -1010,9 +1064,11 @@ class _LinearStats:
                 np.zeros(self.n_features),
                 0.0,
             )
-        x_mean = self.x_sum / self.n
-        y_mean = self.y_sum / self.n
-        gram = self.xtx - self.xp.outer(self.x_sum, self.x_sum) / self.n
+        if self.weight_sum <= 0.0:
+            raise ValueError("cannot center data with zero total sample weight")
+        x_mean = self.x_sum / self.weight_sum
+        y_mean = self.y_sum / self.weight_sum
+        gram = self.xtx - self.xp.outer(self.x_sum, self.x_sum) / self.weight_sum
         xy = self.xty - self.x_sum * y_mean
         return self._cpu(gram), self._cpu(xy), self._cpu(x_mean), float(y_mean)
 
@@ -1039,6 +1095,7 @@ class TorchAdapter(BaseAdapter):
     device: str | None = None
     distributed: bool = False
     streaming: bool = True
+    supports_sample_weight: ClassVar[bool] = True
     early_stopping_patience: int | None = None
     early_stopping_min_delta: float = 0.0
     restore_best: bool = True
@@ -1079,7 +1136,7 @@ class TorchAdapter(BaseAdapter):
         model = model.to(device)
         if self.distributed and world_size > 1:
             model = torch.nn.parallel.DistributedDataParallel(model)
-        loss_fn = self.loss_fn or torch.nn.MSELoss()
+        loss_fn = self.loss_fn or torch.nn.MSELoss(reduction="none")
         optimizer = self._optimizer(torch, model, model_params)
         history: dict[str, dict[str, list[float]]] = {"train": {"loss": []}}
         if val is not None:
@@ -1118,11 +1175,12 @@ class TorchAdapter(BaseAdapter):
             print(f"======== Torch Adapter -- Epoch {epoch}")
             model.train()
             losses = []
-            for xb, yb in self._loader(torch, train, rank, world_size):
+            for xb, yb, wb in self._loader(torch, train, rank, world_size):
                 xb, yb = xb.to(device), yb.to(device)
+                wb = wb.to(device) if wb is not None else None
                 optimizer.zero_grad(set_to_none=True)
                 pred = model(xb).squeeze(-1)
-                loss = loss_fn(pred, yb.float())
+                loss = self._reduce_loss(loss_fn, pred, yb.float(), wb)
                 loss.backward()
                 optimizer.step()
                 losses.append(float(loss.detach().cpu()))
@@ -1318,12 +1376,22 @@ class TorchAdapter(BaseAdapter):
 
         class SourceDataset(torch.utils.data.IterableDataset):
             def __iter__(self):
-                for i, (x, y, _) in enumerate(src.batches(batch_size)):
+                for i, value in enumerate(src.batches(batch_size)):
                     if i % world_size == rank:
-                        x = _writable_array(x, dtype=np.float32)
-                        y = _writable_array(y)
-                        yield torch.as_tensor(x, dtype=torch.float32), torch.as_tensor(
-                            y
+                        batch = as_batch(value)
+                        x = _writable_array(batch.x, dtype=np.float32)
+                        y = _writable_array(batch.y)
+                        weight = (
+                            _writable_array(batch.weight, dtype=np.float32)
+                            if batch.weight is not None
+                            else None
+                        )
+                        yield (
+                            torch.as_tensor(x, dtype=torch.float32),
+                            torch.as_tensor(y),
+                            torch.as_tensor(weight, dtype=torch.float32)
+                            if weight is not None
+                            else None,
                         )
 
         return torch.utils.data.DataLoader(SourceDataset(), batch_size=None)
@@ -1332,12 +1400,52 @@ class TorchAdapter(BaseAdapter):
         self, torch: Any, model: Any, src: "DataSource", loss_fn: Any, device: Any
     ) -> float:
         losses = []
+        masses = []
         model.eval()
         with torch.inference_mode():
-            for xb, yb in self._loader(torch, src, 0, 1):
+            for xb, yb, wb in self._loader(torch, src, 0, 1):
                 pred = model(xb.to(device)).squeeze(-1)
-                losses.append(float(loss_fn(pred, yb.to(device).float()).cpu()))
-        return float(np.mean(losses)) if losses else 0.0
+                wb = wb.to(device) if wb is not None else None
+                loss = self._reduce_loss(
+                    loss_fn,
+                    pred,
+                    yb.to(device).float(),
+                    wb,
+                )
+                losses.append(float(loss.cpu()))
+                masses.append(float(wb.sum().cpu()) if wb is not None else 1.0)
+        if not losses:
+            return 0.0
+        if all(mass == 1.0 for mass in masses):
+            return float(np.mean(losses))
+        return float(np.average(losses, weights=masses))
+
+    @staticmethod
+    def _reduce_loss(
+        loss_fn: Any,
+        pred: Any,
+        target: Any,
+        sample_weight: Any | None,
+    ) -> Any:
+        loss = loss_fn(pred, target)
+        if sample_weight is None:
+            return loss.mean() if loss.ndim else loss
+        if loss.ndim == 0:
+            raise ValueError(
+                "sample weights require loss_fn to return per-sample losses; "
+                "configure it with reduction='none'"
+            )
+        if loss.shape[0] != sample_weight.shape[0]:
+            raise ValueError(
+                "loss and sample weight batch lengths differ: "
+                f"{loss.shape[0]} != {sample_weight.shape[0]}"
+            )
+        if loss.ndim > 1:
+            loss = loss.reshape(loss.shape[0], -1).mean(dim=1)
+        weight_sum = sample_weight.sum()
+        if float(weight_sum.detach().cpu()) <= 0.0:
+            return (loss * sample_weight).sum()
+        return (loss * sample_weight).sum() / weight_sum
 
     def _eval_score(
         self,
@@ -1354,18 +1462,20 @@ class TorchAdapter(BaseAdapter):
         ctx: dict[str, Any] = {"n": 0}
         model.eval()
         with torch.inference_mode():
-            for x, y_true, batch_ctx in src.batches(self.batch_size):
-                x = _writable_array(x, dtype=np.float32)
+            for value in src.batches(self.batch_size):
+                batch = as_batch(value)
+                x = _writable_array(batch.x, dtype=np.float32)
                 xb = torch.as_tensor(x, dtype=torch.float32, device=device)
                 y_pred = self._predict_array(model, xb)
                 state = call_score(
                     score,
-                    y_true,
+                    batch.y,
                     y_pred,
-                    dict(batch_ctx),
+                    dict(batch.ctx),
                     combine_with=state,
+                    sample_weight=batch.weight,
                 )
-                merge_ctx(ctx, batch_ctx)
+                merge_ctx(ctx, batch.ctx)
         if state is None:
             raise ValueError("cannot score empty prediction stream")
         ctx["fold"] = fold

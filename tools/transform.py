@@ -13,7 +13,7 @@ from typing import Any, Protocol, runtime_checkable
 import numpy as np
 import polars as pl
 
-Batch = tuple[np.ndarray, np.ndarray, dict[str, Any]]
+from tools.data import Batch
 
 
 @runtime_checkable
@@ -27,6 +27,7 @@ class FitSource(Protocol):
     dates: list[str]
     target: str
     features: list[str]
+    sample_weight_col: str | None
 
     def frame(self, select: bool = True) -> pl.LazyFrame: ...
 
@@ -74,6 +75,37 @@ class FunctionTransform:
 
     def transform(self, lf: pl.LazyFrame) -> pl.LazyFrame:
         return self.fn(lf)
+
+
+@dataclass
+class ReturnNormalizer:
+    feature: str
+    target: str | None = None
+    eps: float = 1e-12
+
+    def __post_init__(self) -> None:
+        if not self.feature:
+            raise ValueError("feature must be non-empty")
+        if self.eps <= 0.0:
+            raise ValueError("eps must be positive")
+
+    def fit(self, data: Any) -> "ReturnNormalizer":
+        if self.target is None:
+            target = getattr(data, "target", None)
+            if target is None:
+                raise ValueError("ReturnNormalizer needs target or source.target")
+            self.target = str(target)
+        return self
+
+    def transform(self, lf: pl.LazyFrame) -> pl.LazyFrame:
+        if self.target is None:
+            raise RuntimeError("ReturnNormalizer must be fit before transform")
+        denominator = pl.max_horizontal(
+            pl.col(self.feature), pl.lit(float(self.eps))
+        )
+        return lf.with_columns(
+            (pl.col(self.target) / denominator).alias(self.target)
+        )
 
 
 @dataclass

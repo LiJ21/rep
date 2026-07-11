@@ -216,23 +216,32 @@ class _RowShuffleEmitter:
         self._rng = rng
         self._x: np.ndarray | None = None
         self._y: np.ndarray | None = None
+        self._weight: np.ndarray | None = None
         self._filled = 0
         self._reservation: Reservation | None = None
 
     def push(self, batch: Batch, reservation: Reservation) -> None:
-        x, y, _ = batch
+        x, y, weight = batch.x, batch.y, batch.weight
         try:
             if self._x is None:
                 row_bytes = x.itemsize * x.shape[1] + y.dtype.itemsize
+                if weight is not None:
+                    row_bytes += weight.dtype.itemsize
                 self._reservation = self._run.reserve(self._rows * row_bytes)
                 self._x = np.empty((self._rows, x.shape[1]), dtype=x.dtype)
                 self._y = np.empty(self._rows, dtype=y.dtype)
+                if weight is not None:
+                    self._weight = np.empty(self._rows, dtype=weight.dtype)
+            elif (weight is None) != (self._weight is None):
+                raise ValueError("sample weight presence changed within a data stream")
             offset = 0
             while offset < len(y):
                 take = min(self._rows - self._filled, len(y) - offset)
                 stop = self._filled + take
                 self._x[self._filled : stop] = x[offset : offset + take]
                 self._y[self._filled : stop] = y[offset : offset + take]
+                if self._weight is not None and weight is not None:
+                    self._weight[self._filled : stop] = weight[offset : offset + take]
                 self._filled = stop
                 offset += take
                 if self._filled == self._rows:
@@ -245,10 +254,17 @@ class _RowShuffleEmitter:
         perm = self._rng.permutation(self._filled)
         out_rows = self._run.batch_size or self._filled
         row_bytes = self._x.itemsize * self._x.shape[1] + self._y.dtype.itemsize
+        if self._weight is not None:
+            row_bytes += self._weight.dtype.itemsize
         for start in range(0, self._filled, out_rows):
             idx = perm[start : start + out_rows]
             reservation = self._run.reserve(int(idx.size) * row_bytes)
-            batch = (self._x[idx], self._y[idx], {"n": int(idx.size)})
+            batch = Batch(
+                x=self._x[idx],
+                y=self._y[idx],
+                ctx={"n": int(idx.size)},
+                weight=self._weight[idx] if self._weight is not None else None,
+            )
             self._run.queue.put(batch, reservation)
         self._filled = 0
 
@@ -259,7 +275,7 @@ class _RowShuffleEmitter:
     def close(self) -> None:
         if self._reservation is not None:
             self._reservation.release()
-        self._x = self._y = None
+        self._x = self._y = self._weight = None
 
 
 class _Run:
@@ -365,17 +381,28 @@ class _Run:
         return _RowShuffleEmitter(self, self.config.row_shuffle_rows, rng)
 
     def _convert(self, df: pl.DataFrame) -> Batch:
+        batch = _to_batch(
+            df,
+            self.source.features,
+            self.source.target,
+            self.source.sample_weight_col,
+        )
         if self.minimal_ctx:
-            x = df.select(self.source.features).to_numpy()
-            y = df.get_column(self.source.target).to_numpy()
-            return x, y, {"n": df.height}
-        return _to_batch(df, self.source.features, self.source.target)
+            return Batch(
+                x=batch.x,
+                y=batch.y,
+                ctx={"n": df.height},
+                weight=batch.weight,
+            )
+        return batch
 
     def _estimated_cost(self) -> int:
         rows = self.batch_size or 0
         if rows <= 0:
             return 0
         width = len(self.source.features) + 1
+        if self.source.sample_weight_col is not None:
+            width += 1
         itemsize = np.dtype(np_float_dtype(self.source.precision)).itemsize
         row_bytes = width * itemsize + (0 if self.minimal_ctx else 16)
         return rows * row_bytes * (2 if self.config.charge_dataframe else 1)
@@ -386,6 +413,8 @@ class _Run:
         total = len(self.dates)
         done = 0
         held: Reservation | None = None
+        saw_weight = False
+        saw_positive_weight = False
         self._start()
         try:
             with tqdm(desc="Loading data", unit="row", unit_scale=True) as bar:
@@ -412,8 +441,15 @@ class _Run:
                     if held is not None:
                         held.release()
                     held = reservation
-                    bar.update(item[2].get("n", len(item[1])))
+                    if item.weight is not None:
+                        saw_weight = True
+                        saw_positive_weight |= bool(np.any(item.weight > 0))
+                    bar.update(item.ctx.get("n", len(item.y)))
                     yield item
+            if saw_weight and not saw_positive_weight:
+                raise ValueError(
+                    f"{self.source.sample_weight_col} must contain at least one positive value"
+                )
         finally:
             self.stop.set()
             if held is not None:
@@ -559,9 +595,10 @@ def buffered_wrapper(
 
 
 def _batch_nbytes(batch: Batch) -> int:
-    x, y, ctx = batch
-    total = x.nbytes + y.nbytes
-    for value in ctx.values():
+    total = batch.x.nbytes + batch.y.nbytes
+    if batch.weight is not None:
+        total += batch.weight.nbytes
+    for value in batch.ctx.values():
         if isinstance(value, np.ndarray):
             total += value.nbytes
     return total

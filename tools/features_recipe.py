@@ -592,7 +592,11 @@ def _half_life(half_life: HalfLife) -> str | timedelta:
         )
     if isinstance(half_life, Real):
         return f"{_seconds_ns(float(half_life))}ns"
-    if isinstance(half_life, (str, timedelta)):
+    if isinstance(half_life, str):
+        # polars duration strings reject fractional values (e.g. "0.1s");
+        # ours allow them, so re-emit as integer nanoseconds.
+        return f"{_duration_str_ns(half_life)}ns"
+    if isinstance(half_life, timedelta):
         return half_life
     raise TypeError(
         "half_life must be a duration string, timedelta, or positive seconds"

@@ -69,9 +69,35 @@ class LoadHint:
 
 
 Loader = Callable[[list[str]], list[DateFrame]]
-Batch = tuple[np.ndarray, np.ndarray, dict[str, Any]]
 POLARS_ENGINES = {"auto", "streaming", "gpu"}
 Window = tuple[int, int, int, int, int, pl.DataFrame | None]
+
+
+@dataclass(frozen=True)
+class Batch:
+    x: np.ndarray
+    y: np.ndarray
+    ctx: dict[str, Any]
+    weight: np.ndarray | None = None
+
+    def __iter__(self) -> Iterator[Any]:
+        """Preserve the historical ``x, y, ctx = batch`` interface."""
+        yield self.x
+        yield self.y
+        yield self.ctx
+
+    def __len__(self) -> int:
+        return 3
+
+    def __getitem__(self, index: int | slice) -> Any:
+        return (self.x, self.y, self.ctx)[index]
+
+
+def as_batch(value: Batch | tuple[np.ndarray, np.ndarray, dict[str, Any]]) -> Batch:
+    if isinstance(value, Batch):
+        return value
+    x, y, ctx = value
+    return Batch(x=x, y=y, ctx=ctx)
 
 
 def expand_dates(
@@ -160,10 +186,49 @@ def _ctx_from_df(df: pl.DataFrame) -> dict[str, Any]:
     return ctx
 
 
-def _to_batch(df: pl.DataFrame, features: Sequence[str], target: str) -> Batch:
+def _to_batch(
+    df: pl.DataFrame,
+    features: Sequence[str],
+    target: str,
+    sample_weight_col: str | None = None,
+    require_positive_weight: bool = False,
+) -> Batch:
     x = df.select(features).to_numpy()
     y = df.get_column(target).to_numpy()
-    return x, y, _ctx_from_df(df)
+    weight = (
+        df.get_column(sample_weight_col).to_numpy()
+        if sample_weight_col is not None
+        else None
+    )
+    if weight is not None:
+        validate_sample_weight(
+            weight,
+            len(y),
+            sample_weight_col,
+            require_positive=require_positive_weight,
+        )
+    return Batch(x=x, y=y, ctx=_ctx_from_df(df), weight=weight)
+
+
+def validate_sample_weight(
+    weight: np.ndarray,
+    n: int,
+    name: str = "sample_weight",
+    require_positive: bool = False,
+) -> None:
+    weight = np.asarray(weight)
+    if weight.ndim != 1:
+        raise ValueError(f"{name} must be one-dimensional, got shape {weight.shape}")
+    if len(weight) != n:
+        raise ValueError(f"batch length mismatch: y={n} {name}={len(weight)}")
+    if not np.issubdtype(weight.dtype, np.number):
+        raise TypeError(f"{name} must be numeric, got dtype {weight.dtype}")
+    if not np.all(np.isfinite(weight)):
+        raise ValueError(f"{name} must contain only finite values")
+    if np.any(weight < 0):
+        raise ValueError(f"{name} must be nonnegative")
+    if require_positive and n and not np.any(weight > 0):
+        raise ValueError(f"{name} must contain at least one positive value per batch")
 
 
 def _check_polars_engine(engine: str) -> str:
@@ -192,11 +257,14 @@ class DataSource:
     cache_key: tuple[Any, ...] | None = None
     polars_engine: str = "streaming"
     precision: str = "float64"
+    sample_weight_col: str | None = None
     _frames: list[DateFrame] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.polars_engine = _check_polars_engine(self.polars_engine)
         self.precision = check_precision(self.precision)
+        if self.sample_weight_col == "":
+            raise ValueError("sample_weight_col must be non-empty or None")
 
     def date_frames(self, hint: LoadHint | None = None) -> list[DateFrame]:
         if hint is not None:
@@ -237,6 +305,8 @@ class DataSource:
             self.frame().collect(engine=self.polars_engine),
             self.features,
             self.target,
+            self.sample_weight_col,
+            require_positive_weight=True,
         )
         if self.cache is not None and self.cache_key is not None:
             self.cache[self.cache_key] = batch
@@ -247,11 +317,25 @@ class DataSource:
     ) -> Iterator[Batch]:
         from tqdm import tqdm
 
+        saw_weight = False
+        saw_positive_weight = False
         with tqdm(desc="Loading data", unit="row", unit_scale=True) as bar:
             for df in self.dataframe_batches(batch_size, multicollect):
-                batch = _to_batch(df, self.features, self.target)
-                bar.update(batch[2]["n"])
+                batch = _to_batch(
+                    df,
+                    self.features,
+                    self.target,
+                    self.sample_weight_col,
+                )
+                if batch.weight is not None:
+                    saw_weight = True
+                    saw_positive_weight |= bool(np.any(batch.weight > 0))
+                bar.update(batch.ctx["n"])
                 yield batch
+        if saw_weight and not saw_positive_weight:
+            raise ValueError(
+                f"{self.sample_weight_col} must contain at least one positive value"
+            )
 
     def dataframe_batches(
         self,
@@ -275,7 +359,7 @@ class DataSource:
             if batch_size is not None or front_pad > 0
             else None
         )
-        selected = _ordered_unique(cols or [*self.features, self.target, *CTX_COLS])
+        selected = _ordered_unique(cols or self._default_cols())
 
         for item in self.iter_date_frames(hint):
             internal_cols = _stateful_internal_cols(item.stateful_features)
@@ -438,6 +522,7 @@ class DataSource:
             features=list(self.features),
             filters=self.filters,
             transform=compose_transform(self.transform, transform),
+            sample_weight_col=self.sample_weight_col,
             cache=self.cache,
             cache_key=cache_key,
             polars_engine=self.polars_engine,
@@ -463,11 +548,13 @@ class DataSource:
             lf = self.transform.transform(lf)
         if not select:
             return lf
-        selected = cols or [*self.features, self.target, *CTX_COLS]
+        selected = cols or self._default_cols()
         return lf.select(self._select_exprs(selected))
 
     def _select_exprs(self, cols: Sequence[str]) -> list[pl.Expr]:
         public_cols = {*self.features, self.target}
+        if self.sample_weight_col is not None:
+            public_cols.add(self.sample_weight_col)
         dtype = float_dtype(self.precision)
         exprs: list[pl.Expr] = []
         for col in _ordered_unique(cols):
@@ -476,6 +563,12 @@ class DataSource:
                 expr = expr.cast(dtype)
             exprs.append(expr.alias(col))
         return exprs
+
+    def _default_cols(self) -> list[str]:
+        weight_cols = (
+            [self.sample_weight_col] if self.sample_weight_col is not None else []
+        )
+        return [*self.features, self.target, *weight_cols, *CTX_COLS]
 
 
 class Raw:

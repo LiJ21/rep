@@ -1174,7 +1174,7 @@ class TorchAdapter(BaseAdapter):
         for epoch in range(self.epochs):
             print(f"======== Torch Adapter -- Epoch {epoch}")
             model.train()
-            losses = []
+            loss_sum = loss_mass = 0.0
             for xb, yb, wb in self._loader(torch, train, rank, world_size):
                 xb, yb = xb.to(device), yb.to(device)
                 wb = wb.to(device) if wb is not None else None
@@ -1183,8 +1183,10 @@ class TorchAdapter(BaseAdapter):
                 loss = self._reduce_loss(loss_fn, pred, yb.float(), wb)
                 loss.backward()
                 optimizer.step()
-                losses.append(float(loss.detach().cpu()))
-            metrics = {"torch/train_loss": float(np.mean(losses)) if losses else 0.0}
+                mass = float(wb.sum().detach().cpu()) if wb is not None else len(yb)
+                loss_sum += float(loss.detach().cpu()) * mass
+                loss_mass += mass
+            metrics = {"torch/train_loss": loss_sum / loss_mass if loss_mass else 0.0}
             history["train"]["loss"].append(metrics["torch/train_loss"])
             if val is not None:
                 metrics["torch/val_loss"] = self._eval_loss(
@@ -1399,8 +1401,7 @@ class TorchAdapter(BaseAdapter):
     def _eval_loss(
         self, torch: Any, model: Any, src: "DataSource", loss_fn: Any, device: Any
     ) -> float:
-        losses = []
-        masses = []
+        loss_sum = loss_mass = 0.0
         model.eval()
         with torch.inference_mode():
             for xb, yb, wb in self._loader(torch, src, 0, 1):
@@ -1412,13 +1413,10 @@ class TorchAdapter(BaseAdapter):
                     yb.to(device).float(),
                     wb,
                 )
-                losses.append(float(loss.cpu()))
-                masses.append(float(wb.sum().cpu()) if wb is not None else 1.0)
-        if not losses:
-            return 0.0
-        if all(mass == 1.0 for mass in masses):
-            return float(np.mean(losses))
-        return float(np.average(losses, weights=masses))
+                mass = float(wb.sum().cpu()) if wb is not None else len(yb)
+                loss_sum += float(loss.cpu()) * mass
+                loss_mass += mass
+        return loss_sum / loss_mass if loss_mass else 0.0
 
     @staticmethod
     def _reduce_loss(
